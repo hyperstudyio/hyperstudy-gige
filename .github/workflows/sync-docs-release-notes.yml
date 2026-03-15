@@ -39,7 +39,7 @@ jobs:
       - name: Checkout hyperstudy-docs
         uses: actions/checkout@v4
         with:
-          repository: ljchang/hyperstudy-docs
+          repository: hyperstudyio/hyperstudy-docs
           token: ${{ secrets.DOCS_REPO_TOKEN }}
           path: docs-repo
 

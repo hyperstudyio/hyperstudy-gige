@@ -297,7 +297,7 @@ git push origin v1.0.0
 gh run list --limit 1
 
 # Or view in browser
-open https://github.com/ljchang/hyperstudy-gige/actions
+open https://github.com/hyperstudyio/hyperstudy-gige/actions
 ```
 
 **Step 4: Verify the Release**
@@ -320,7 +320,7 @@ gh release list
 gh release view v1.0.0
 
 # Or in browser
-open https://github.com/ljchang/hyperstudy-gige/releases
+open https://github.com/hyperstudyio/hyperstudy-gige/releases
 ```
 
 **Total time:** ~15-20 minutes from tag push to published release

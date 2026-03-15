@@ -1,6 +1,6 @@
 # GigE Virtual Camera for macOS
 
-[![Build and Release](https://github.com/ljchang/hyperstudy-gige/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/ljchang/hyperstudy-gige/actions/workflows/build-and-release.yml)
+[![Build and Release](https://github.com/hyperstudyio/hyperstudy-gige/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/hyperstudyio/hyperstudy-gige/actions/workflows/build-and-release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![macOS](https://img.shields.io/badge/macOS-12.3+-blue.svg)](https://www.apple.com/macos/)
 [![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey.svg)](https://support.apple.com/en-us/HT211814)
@@ -27,12 +27,12 @@ A native macOS application that creates virtual cameras from GigE Vision industr
 
 ### Download Release
 
-**[Download the latest release →](https://github.com/ljchang/hyperstudy-gige/releases/latest)**
+**[Download the latest release →](https://github.com/hyperstudyio/hyperstudy-gige/releases/latest)**
 
 ### Step-by-Step Installation
 
 1. **Download the DMG**
-   - Go to the [Releases page](https://github.com/ljchang/hyperstudy-gige/releases)
+   - Go to the [Releases page](https://github.com/hyperstudyio/hyperstudy-gige/releases)
    - Download the latest `GigEVirtualCamera-vX.X.X.dmg` file
    - The app is fully signed and notarized by Apple
 
@@ -108,7 +108,7 @@ A native macOS application that creates virtual cameras from GigE Vision industr
 
 ```bash
 # Clone the repository
-git clone https://github.com/ljchang/hyperstudy-gige.git
+git clone https://github.com/hyperstudyio/hyperstudy-gige.git
 cd hyperstudy-gige
 
 # Install dependencies

@@ -42,6 +42,7 @@ jobs:
           repository: hyperstudyio/hyperstudy-docs
           token: ${{ secrets.DOCS_REPO_TOKEN }}
           path: docs-repo
+          persist-credentials: false
 
       - name: Check if release already exists
         id: check
@@ -59,27 +60,34 @@ jobs:
 
       - name: Update release notes
         if: steps.check.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          DATE: ${{ steps.release.outputs.date }}
+          BODY: ${{ steps.release.outputs.body }}
         run: |
-          TAG="${{ steps.release.outputs.tag }}"
-          DATE="${{ steps.release.outputs.date }}"
           FILE="docs-repo/docs/devices/hyperstudy-gige.md"
 
-          # Create the new release entry
-          RELEASE_ENTRY="### $TAG
+          # Create the new release entry in a temp file
+          {
+            echo "### $TAG"
+            echo ""
+            echo "**Released:** $DATE"
+            echo ""
+            echo "$BODY"
+            echo ""
+            echo "---"
+          } > /tmp/release_entry.txt
 
-**Released:** $DATE
-
-${{ steps.release.outputs.body }}
-
----"
-
-          # Insert after RELEASE_NOTES_START marker
-          # Use awk to insert content after the marker line
-          awk -v entry="$RELEASE_ENTRY" '
+          # Insert after RELEASE_NOTES_START marker using awk
+          awk '
             /<!-- RELEASE_NOTES_START -->/ {
               print
               print ""
-              print entry
+              while ((getline line < "/tmp/release_entry.txt") > 0) {
+                print line
+              }
+              close("/tmp/release_entry.txt")
+              print ""
               next
             }
             { print }
@@ -87,13 +95,26 @@ ${{ steps.release.outputs.body }}
 
           echo "Updated $FILE with release $TAG"
 
-      - name: Commit and push
+      - name: Commit and push via API
         if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
         run: |
-          cd docs-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/devices/hyperstudy-gige.md
-          git commit -m "Update GigE Virtual Camera release notes for ${{ steps.release.outputs.tag }}" || exit 0
-          git push
+          FILE_PATH="docs/devices/hyperstudy-gige.md"
+          TAG="${{ steps.release.outputs.tag }}"
 
+          # Get the current file SHA (required for updates)
+          FILE_SHA=$(gh api "repos/hyperstudyio/hyperstudy-docs/contents/${FILE_PATH}" --jq '.sha')
+
+          # Base64-encode the updated file content
+          CONTENT_B64=$(base64 -w 0 "docs-repo/${FILE_PATH}")
+
+          # Push via the Contents API
+          gh api --method PUT "repos/hyperstudyio/hyperstudy-docs/contents/${FILE_PATH}" \
+            -f message="Update GigE Virtual Camera release notes for ${TAG}" \
+            -f content="${CONTENT_B64}" \
+            -f sha="${FILE_SHA}" \
+            -f "committer[name]=github-actions[bot]" \
+            -f "committer[email]=github-actions[bot]@users.noreply.github.com"
+
+          echo "Successfully pushed release notes for ${TAG} via API"

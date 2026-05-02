@@ -399,6 +399,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # The `release: published` event from a GITHUB_TOKEN-created
+      # release does NOT trigger downstream workflows (GitHub blocks
+      # this to prevent loops), so the sync-docs workflow would never
+      # auto-fire on tag-push releases. workflow_dispatch IS exempt
+      # from that suppression, so dispatch it explicitly here.
+      - name: Trigger docs release-notes sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "Sync Release Notes to Docs" \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f tag="${{ steps.version.outputs.VERSION }}"
+
       - name: Cleanup keychain
         if: always()
         run: |

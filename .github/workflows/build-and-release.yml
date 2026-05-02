@@ -35,6 +35,19 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
 
+      - name: Stamp version into Info.plists
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          VERSION_NUM="${VERSION#v}"
+          for plist in GigECameraApp/Info.plist GigEVirtualCameraExtension/Info.plist; do
+            plutil -replace CFBundleShortVersionString -string "$VERSION_NUM" "$plist"
+            plutil -replace CFBundleVersion           -string "$VERSION_NUM" "$plist"
+          done
+          echo "App Info.plist:"
+          plutil -p GigECameraApp/Info.plist | grep -E 'CFBundle(ShortVersionString|Version)'
+          echo "Extension Info.plist:"
+          plutil -p GigEVirtualCameraExtension/Info.plist | grep -E 'CFBundle(ShortVersionString|Version)'
+
       - name: Install dependencies
         run: |
           echo "Installing Homebrew dependencies..."

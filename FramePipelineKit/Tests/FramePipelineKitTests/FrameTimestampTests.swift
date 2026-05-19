@@ -26,4 +26,11 @@ import Testing
         let b = FrameTimestamp(frameID: 7, cameraTimestampNs: 0, hostTimestampNs: 0)
         #expect(b.droppedFrames(since: a) == 0)
     }
+
+    @Test func firstFrameZeroBaseReportsZero() {
+        // Both previous and current have frameID == 0 — first-frame / zero-base case.
+        let a = FrameTimestamp(frameID: 0, cameraTimestampNs: 0, hostTimestampNs: 0)
+        let b = FrameTimestamp(frameID: 0, cameraTimestampNs: 0, hostTimestampNs: 0)
+        #expect(b.droppedFrames(since: a) == 0)
+    }
 }

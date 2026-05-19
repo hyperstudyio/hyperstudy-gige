@@ -6,7 +6,7 @@ import Foundation
 /// records exactly which frames were delivered or dropped and their capture-time
 /// stamps. Gaps in `frame_id` plus explicit drop rows make missing frames
 /// observable instead of silent.
-public final class FrameManifestWriter {
+public final class FrameManifestWriter: @unchecked Sendable {
     public enum Status: String {
         case delivered
         case droppedBuffer = "dropped_buffer" // discarded by the bounded ring (consumer behind)
@@ -17,6 +17,7 @@ public final class FrameManifestWriter {
 
     private let handle: FileHandle
     private let lock = NSLock()
+    private var _isClosed = false
 
     public init(url: URL) throws {
         FileManager.default.createFile(atPath: url.path, contents: nil)
@@ -30,12 +31,15 @@ public final class FrameManifestWriter {
 
     public func close() {
         lock.lock(); defer { lock.unlock() }
+        guard !_isClosed else { return }
+        _isClosed = true
         try? handle.close()
     }
 
     private func write(_ line: String) {
         guard let data = line.data(using: .utf8) else { return }
         lock.lock(); defer { lock.unlock() }
+        guard !_isClosed else { return }
         handle.write(data)
     }
 }

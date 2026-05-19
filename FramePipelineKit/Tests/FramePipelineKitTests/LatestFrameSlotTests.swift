@@ -28,4 +28,19 @@ import Testing
         _ = slot.take()
         #expect(slot.take() == nil)
     }
+
+    @Test func concurrentSetAndTakeDoesNotCrash() async {
+        let slot = LatestFrameSlot<Int>()
+        await withTaskGroup(of: Void.self) { group in
+            for i in 0 ..< 500 {
+                group.addTask { slot.set(i) }
+            }
+            for _ in 0 ..< 500 {
+                group.addTask { _ = slot.take() }
+            }
+        }
+        // If we reach here without a crash, the lock correctly serialised all accesses.
+        // droppedCount must be non-negative and the slot may or may not hold a value.
+        #expect(slot.droppedCount >= 0)
+    }
 }

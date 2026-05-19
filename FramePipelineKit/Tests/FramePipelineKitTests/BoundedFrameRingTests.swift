@@ -30,4 +30,29 @@ import Testing
         let ring = BoundedFrameRing<Int>(capacity: 4)
         #expect(ring.pop() == nil)
     }
+
+    @Test func capacityOneDropsAndReplacesEveryPush() {
+        let ring = BoundedFrameRing<Int>(capacity: 1)
+        #expect(ring.push(10) == nil)         // first push: no drop
+        #expect(ring.push(20) == 10)          // second push: drops 10, replaces with 20
+        #expect(ring.push(30) == 20)          // third push: drops 20, replaces with 30
+        #expect(ring.totalDropped == 2)
+        #expect(ring.count == 1)
+        #expect(ring.pop() == 30)
+        #expect(ring.pop() == nil)
+    }
+
+    @Test func concurrentPushPopNeverExceedsCapacity() async {
+        let capacity = 8
+        let ring = BoundedFrameRing<Int>(capacity: capacity)
+        await withTaskGroup(of: Void.self) { group in
+            for i in 0 ..< 200 {
+                group.addTask { ring.push(i) }
+            }
+            for _ in 0 ..< 200 {
+                group.addTask { _ = ring.pop() }
+            }
+        }
+        #expect(ring.count <= capacity)
+    }
 }

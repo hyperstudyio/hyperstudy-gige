@@ -13,7 +13,7 @@ public final class BoundedFrameRing<Value>: @unchecked Sendable {
     public init(capacity: Int) {
         precondition(capacity > 0, "capacity must be > 0")
         self.capacity = capacity
-        storage.reserveCapacity(capacity + 1)
+        storage.reserveCapacity(capacity)
     }
 
     /// Append `value`. If at capacity, drop and return the oldest element.

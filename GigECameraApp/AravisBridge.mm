@@ -573,6 +573,12 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
     gint width, height;
     const void *data = arv_buffer_get_data(buffer, NULL);
     arv_buffer_get_image_region(buffer, NULL, NULL, &width, &height);
+    // Capture-time identity, read before any conversion work so timing never
+    // inherits downstream queue jitter. CLOCK_UPTIME_RAW shares the mach
+    // timebase used by CMClockGetHostTimeClock, so it is a valid host-domain PTS.
+    uint64_t frameID = arv_buffer_get_frame_id(buffer);
+    uint64_t cameraTimestampNs = arv_buffer_get_timestamp(buffer);
+    uint64_t hostTimestampNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     ArvPixelFormat pixel_format = arv_buffer_get_image_pixel_format(buffer);
     
     // Update current resolution
@@ -644,7 +650,7 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
     if (pixelBuffer && self.delegate) {
         static int delegateCallCount = 0;
         delegateCallCount++;
-        
+
         // Log IOSurface info
         IOSurfaceRef surface = CVPixelBufferGetIOSurface(pixelBuffer);
         if (delegateCallCount % 30 == 1) {
@@ -655,15 +661,16 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
                 NSLog(@"AravisBridge: WARNING - Frame #%d has no IOSurface!", delegateCallCount);
             }
         }
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self.delegate) {
-                [self.delegate aravisBridge:self didReceiveFrame:pixelBuffer];
-            } else {
-                NSLog(@"AravisBridge: WARNING - No delegate set, dropping frame!");
-            }
-            CVPixelBufferRelease(pixelBuffer);
-        });
+
+        // Deliver synchronously on the frame queue. The delegate fan-out is a
+        // cheap, non-blocking enqueue (see GigECameraManager), so the acquisition
+        // loop is not stalled and the Aravis buffer is recycled promptly below.
+        [self.delegate aravisBridge:self
+                    didReceiveFrame:pixelBuffer
+                            frameID:frameID
+                  cameraTimestampNs:cameraTimestampNs
+                    hostTimestampNs:hostTimestampNs];
+        CVPixelBufferRelease(pixelBuffer);
     } else {
         if (pixelBuffer) {
             NSLog(@"AravisBridge: Have pixelBuffer but no delegate!");

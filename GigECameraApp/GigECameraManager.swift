@@ -8,6 +8,8 @@
 import Foundation
 import CoreVideo
 import Combine
+import os.signpost
+import FramePipelineKit
 
 // Using stub implementation for now
 // When Aravis is properly integrated, remove the stub
@@ -24,10 +26,47 @@ import Combine
     @Published var preferredPixelFormat: String = "Auto"
     
     private let aravisBridge = AravisBridge()
-    private var frameHandlers: [(CVPixelBuffer) -> Void] = []
     private var lastDiscoveryTime = Date.distantPast
     private var connectionRetryCount = 0
-    private var frameDistributionCount = 0
+
+    private static let signpostLog = OSLog(subsystem: "com.lukechang.GigEVirtualCamera",
+                                           category: "FramePipeline")
+
+    // MARK: - Frame fan-out
+    /// One frame plus its capture-time identity, passed to both consumers.
+    public struct PipelineFrame {
+        public let pixelBuffer: CVPixelBuffer
+        public let timestamp: FrameTimestamp
+    }
+
+    /// Preview consumer: drop-to-latest; cosmetic, never logged.
+    private let previewSlot = LatestFrameSlot<PipelineFrame>()
+    private let previewQueue = DispatchQueue(label: "com.lukechang.gigecamera.preview", qos: .userInitiated)
+
+    /// Stream consumer: bounded FIFO; drops are logged to the manifest.
+    private let streamRing = BoundedFrameRing<PipelineFrame>(capacity: 6)
+    let streamQueue = DispatchQueue(label: "com.lukechang.gigecamera.stream", qos: .userInitiated)
+
+    // Lock protecting both frame-delivery closures.
+    private let callbackLock = NSLock()
+
+    private var _onPreviewFrame: ((PipelineFrame) -> Void)?
+    /// Invoked on `previewQueue` with the newest available frame.
+    public var onPreviewFrame: ((PipelineFrame) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onPreviewFrame }
+        set { callbackLock.lock(); defer { callbackLock.unlock() }; _onPreviewFrame = newValue }
+    }
+
+    private var _onStreamFrame: ((PipelineFrame) -> Bool)?
+    /// Invoked on `streamQueue`; returns true if the frame was enqueued to the sink.
+    public var onStreamFrame: ((PipelineFrame) -> Bool)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onStreamFrame }
+        set { callbackLock.lock(); defer { callbackLock.unlock() }; _onStreamFrame = newValue }
+    }
+
+    /// Sidecar manifest; non-nil only while a streaming session is active.
+    private var manifestWriter: FrameManifestWriter?
+    private let manifestLock = NSLock()
     
     
     override init() {
@@ -196,12 +235,30 @@ import Combine
     
     // MARK: - Frame Handling
     
-    func addFrameHandler(_ handler: @escaping (CVPixelBuffer) -> Void) {
-        frameHandlers.append(handler)
+    /// Begin a manifest for a new streaming session. Safe to call repeatedly.
+    func startManifest() {
+        manifestLock.lock(); defer { manifestLock.unlock() }
+        guard manifestWriter == nil else { return }
+        let dir = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GigEVirtualCamera/manifests", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let url = dir.appendingPathComponent("frames-\(stamp).csv")
+        manifestWriter = try? FrameManifestWriter(url: url)
+        print("GigECameraManager: frame manifest -> \(url.path)")
     }
-    
-    func removeAllFrameHandlers() {
-        frameHandlers.removeAll()
+
+    /// Close the current manifest at the end of a streaming session.
+    func stopManifest() {
+        manifestLock.lock(); defer { manifestLock.unlock() }
+        manifestWriter?.close()
+        manifestWriter = nil
+    }
+
+    private func recordManifest(_ ts: FrameTimestamp, status: FrameManifestWriter.Status) {
+        manifestLock.lock(); defer { manifestLock.unlock() }
+        manifestWriter?.record(ts, status: status)
     }
     
     // MARK: - Camera Settings
@@ -259,20 +316,38 @@ import Combine
 // MARK: - AravisBridgeDelegate
 
 extension GigECameraManager: AravisBridgeDelegate {
-    @objc func aravisBridge(_ bridge: Any, didReceiveFrame pixelBuffer: CVPixelBuffer) {
-        print("GigECameraManager: 🎯 didReceiveFrame called!")
-        // Notify all frame handlers
-        if frameHandlers.isEmpty {
-            print("GigECameraManager: ⚠️ Received frame but no handlers registered!")
-        } else {
-            // Only log every 30th frame to avoid spam
-            frameDistributionCount += 1
-            if frameDistributionCount == 1 || frameDistributionCount % 30 == 0 {
-                print("GigECameraManager: 📹 Distributing frame #\(frameDistributionCount) to \(frameHandlers.count) handlers")
-            }
-            for handler in frameHandlers {
-                handler(pixelBuffer)
-            }
+    @objc func aravisBridge(_ bridge: Any,
+                            didReceiveFrame pixelBuffer: CVPixelBuffer,
+                            frameID: UInt64,
+                            cameraTimestampNs: UInt64,
+                            hostTimestampNs: UInt64) {
+        // Runs on the Aravis frame queue. Do only cheap, non-blocking work here.
+        let ts = FrameTimestamp(frameID: frameID,
+                                cameraTimestampNs: cameraTimestampNs,
+                                hostTimestampNs: hostTimestampNs)
+        let frame = PipelineFrame(pixelBuffer: pixelBuffer, timestamp: ts)
+
+        // Preview: keep only the newest; render off the acquisition thread.
+        previewSlot.set(frame)
+        previewQueue.async { [weak self] in
+            guard let self, let latest = self.previewSlot.take() else { return }
+            let cb = self.onPreviewFrame      // locked read
+            os_signpost(.begin, log: Self.signpostLog, name: "preview-render")
+            cb?(latest)
+            os_signpost(.end, log: Self.signpostLog, name: "preview-render")
+        }
+
+        // Stream: bounded buffer; a displaced frame is a logged buffer-drop.
+        if let dropped = streamRing.push(frame) {
+            recordManifest(dropped.timestamp, status: .droppedBuffer)
+        }
+        streamQueue.async { [weak self] in
+            guard let self, let next = self.streamRing.pop() else { return }
+            let cb = self.onStreamFrame       // locked read
+            os_signpost(.begin, log: Self.signpostLog, name: "stream-send")
+            let delivered = cb?(next) ?? false
+            os_signpost(.end, log: Self.signpostLog, name: "stream-send")
+            self.recordManifest(next.timestamp, status: delivered ? .delivered : .droppedQueue)
         }
     }
     

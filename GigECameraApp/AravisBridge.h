@@ -28,7 +28,11 @@ typedef NS_ENUM(NSInteger, AravisCameraState) {
 };
 
 @protocol AravisBridgeDelegate <NSObject>
-- (void)aravisBridge:(id)bridge didReceiveFrame:(CVPixelBufferRef)pixelBuffer;
+- (void)aravisBridge:(id)bridge
+      didReceiveFrame:(CVPixelBufferRef)pixelBuffer
+              frameID:(uint64_t)frameID
+    cameraTimestampNs:(uint64_t)cameraTimestampNs
+      hostTimestampNs:(uint64_t)hostTimestampNs;
 - (void)aravisBridge:(id)bridge didChangeState:(AravisCameraState)state;
 - (void)aravisBridge:(id)bridge didEncounterError:(NSError *)error;
 @end

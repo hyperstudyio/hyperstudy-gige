@@ -13,19 +13,51 @@ import os.log
 class PixelBufferConverter {
     private let logger = Logger(subsystem: "com.lukechang.GigEVirtualCamera", category: "PixelBufferConverter")
     private var converter: VTPixelTransferSession?
-    
+
+    // Reused output pool, recreated only when the output dimensions change.
+    private var pool: CVPixelBufferPool?
+    private var poolWidth = 0
+    private var poolHeight = 0
+
     init() {
-        // Create pixel transfer session
         VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &converter)
-        
         if let converter = converter {
-            // Set conversion quality
             VTSessionSetProperty(converter, key: kVTPixelTransferPropertyKey_ScalingMode, value: kVTScalingMode_Normal)
         }
     }
-    
+
     deinit {
         converter = nil
+    }
+
+    /// Returns a recycled YUV420 IOSurface-backed buffer of the given size,
+    /// (re)building the pool only when dimensions change.
+    private func dequeueYUVBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        if pool == nil || width != poolWidth || height != poolHeight {
+            let bufferAttrs: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+            ]
+            var newPool: CVPixelBufferPool?
+            let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil,
+                                                 bufferAttrs as CFDictionary, &newPool)
+            guard status == kCVReturnSuccess, let createdPool = newPool else {
+                logger.error("Failed to create pixel buffer pool: \(status)")
+                return nil
+            }
+            pool = createdPool
+            poolWidth = width
+            poolHeight = height
+        }
+        var buffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool!, &buffer)
+        guard status == kCVReturnSuccess else {
+            logger.error("Failed to dequeue pooled buffer: \(status)")
+            return nil
+        }
+        return buffer
     }
     
     /// Convert BGRA to YUV420 (420v) format for video streaming
@@ -38,26 +70,7 @@ class PixelBufferConverter {
         let width = CVPixelBufferGetWidth(bgraBuffer)
         let height = CVPixelBufferGetHeight(bgraBuffer)
         
-        // Create YUV420 output buffer
-        let pixelBufferAttributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
-        ]
-        
-        var yuvBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            width,
-            height,
-            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            pixelBufferAttributes as CFDictionary,
-            &yuvBuffer
-        )
-        
-        guard status == kCVReturnSuccess, let outputBuffer = yuvBuffer else {
-            logger.error("Failed to create YUV buffer: \(status)")
+        guard let outputBuffer = dequeueYUVBuffer(width: width, height: height) else {
             return nil
         }
         
@@ -92,26 +105,7 @@ class PixelBufferConverter {
             return nil
         }
         
-        // Create scaled YUV buffer
-        let pixelBufferAttributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            kCVPixelBufferWidthKey: targetWidth,
-            kCVPixelBufferHeightKey: targetHeight,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
-        ]
-        
-        var scaledBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            targetWidth,
-            targetHeight,
-            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            pixelBufferAttributes as CFDictionary,
-            &scaledBuffer
-        )
-        
-        guard status == kCVReturnSuccess, let outputBuffer = scaledBuffer else {
-            logger.error("Failed to create scaled buffer: \(status)")
+        guard let outputBuffer = dequeueYUVBuffer(width: targetWidth, height: targetHeight) else {
             return nil
         }
         

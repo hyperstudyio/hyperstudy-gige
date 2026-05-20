@@ -682,24 +682,24 @@ class PreviewFrameHandler: ObservableObject {
     
     private func setupFrameHandler() {
         print("PreviewFrameHandler: Setting up frame handler")
-        
-        // Add frame handler with simpler conversion
-        gigEManager.addFrameHandler { [weak self] pixelBuffer in
+
+        // Use the preview slot callback (drop-to-latest, independent of stream path).
+        gigEManager.onPreviewFrame = { [weak self] frame in
             guard let self = self else { return }
-            
+
             self.frameCount += 1
-            
+
             // Only log every 30th frame
             if self.frameCount % 30 == 1 {
                 print("PreviewFrameHandler: Got frame #\(self.frameCount)")
             }
-            
-            // Simple CIImage to NSImage conversion
-            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+
+            // Simple CIImage to NSImage conversion (runs on previewQueue)
+            let ciImage = CIImage(cvPixelBuffer: frame.pixelBuffer)
             let rep = NSCIImageRep(ciImage: ciImage)
             let nsImage = NSImage(size: rep.size)
             nsImage.addRepresentation(rep)
-            
+
             // Update on main thread
             DispatchQueue.main.async {
                 self.currentImage = nsImage
@@ -708,14 +708,14 @@ class PreviewFrameHandler: ObservableObject {
                 }
             }
         }
-        
+
         print("PreviewFrameHandler: Frame handler added")
     }
-    
+
     func stopReceivingFrames() {
         print("PreviewFrameHandler: Stopping frame reception after \(frameCount) frames")
         gigEManager.stopStreaming()
-        gigEManager.removeAllFrameHandlers()
+        gigEManager.onPreviewFrame = nil
         frameCount = 0
     }
 }

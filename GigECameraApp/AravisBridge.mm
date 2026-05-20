@@ -650,7 +650,7 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
     if (pixelBuffer && self.delegate) {
         static int delegateCallCount = 0;
         delegateCallCount++;
-        
+
         // Log IOSurface info
         IOSurfaceRef surface = CVPixelBufferGetIOSurface(pixelBuffer);
         if (delegateCallCount % 30 == 1) {
@@ -661,19 +661,15 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
                 NSLog(@"AravisBridge: WARNING - Frame #%d has no IOSurface!", delegateCallCount);
             }
         }
-        
+
         // Deliver synchronously on the frame queue. The delegate fan-out is a
         // cheap, non-blocking enqueue (see GigECameraManager), so the acquisition
         // loop is not stalled and the Aravis buffer is recycled promptly below.
-        if (self.delegate) {
-            [self.delegate aravisBridge:self
-                        didReceiveFrame:pixelBuffer
-                                frameID:frameID
-                      cameraTimestampNs:cameraTimestampNs
-                        hostTimestampNs:hostTimestampNs];
-        } else {
-            NSLog(@"AravisBridge: WARNING - No delegate set, dropping frame!");
-        }
+        [self.delegate aravisBridge:self
+                    didReceiveFrame:pixelBuffer
+                            frameID:frameID
+                  cameraTimestampNs:cameraTimestampNs
+                    hostTimestampNs:hostTimestampNs];
         CVPixelBufferRelease(pixelBuffer);
     } else {
         if (pixelBuffer) {

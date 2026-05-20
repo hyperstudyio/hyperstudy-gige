@@ -398,7 +398,7 @@ class CMIOSinkConnector {
         // when the frame was captured — not when it happened to be processed.
         var timingInfo = CMSampleTimingInfo(
             duration: CMTime.invalid,
-            presentationTimeStamp: CMTimeMake(value: Int64(timestamp.hostTimestampNs),
+            presentationTimeStamp: CMTimeMake(value: Int64(bitPattern: timestamp.hostTimestampNs),
                                               timescale: 1_000_000_000),
             decodeTimeStamp: CMTime.invalid
         )

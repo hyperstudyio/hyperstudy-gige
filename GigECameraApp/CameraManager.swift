@@ -705,7 +705,12 @@ class CameraManager: NSObject, ObservableObject {
         logger.info("Sending test frame...")
         let hostNs = DispatchTime.now().uptimeNanoseconds
         let testTimestamp = FrameTimestamp(frameID: 0, cameraTimestampNs: 0, hostTimestampNs: hostNs)
-        sinkConnector.sendFrame(testBuffer, timestamp: testTimestamp)
+        let connector = sinkConnector
+        let buffer = testBuffer
+        let ts = testTimestamp
+        GigECameraManager.shared.streamQueue.async {
+            connector.sendFrame(buffer, timestamp: ts)
+        }
     }
     
     private func showPreview() {
@@ -802,22 +807,24 @@ class CameraManager: NSObject, ObservableObject {
         
         // Called when connection state changes
         sinkConnector.onConnectionStateChanged = { [weak self] connected in
-            guard let self = self else { return }
-            
-            self.isFrameSenderConnected = connected
+            DispatchQueue.main.async {
+                guard let self = self else { return }
 
-            if connected {
-                GigECameraManager.shared.startManifest()
-                self.logger.info("✅ Sink connector connected via property listener callback!")
+                self.isFrameSenderConnected = connected
 
-                // Start Aravis streaming if camera is connected but not streaming
-                if self.isConnected && !GigECameraManager.shared.isStreaming {
-                    self.logger.info("Starting Aravis streaming after sink connection")
-                    GigECameraManager.shared.startStreaming()
+                if connected {
+                    GigECameraManager.shared.startManifest()
+                    self.logger.info("✅ Sink connector connected via property listener callback!")
+
+                    // Start Aravis streaming if camera is connected but not streaming
+                    if self.isConnected && !GigECameraManager.shared.isStreaming {
+                        self.logger.info("Starting Aravis streaming after sink connection")
+                        GigECameraManager.shared.startStreaming()
+                    }
+                } else {
+                    GigECameraManager.shared.stopManifest()
+                    self.logger.warning("⚠️ Sink connector disconnected")
                 }
-            } else {
-                GigECameraManager.shared.stopManifest()
-                self.logger.warning("⚠️ Sink connector disconnected")
             }
         }
     }

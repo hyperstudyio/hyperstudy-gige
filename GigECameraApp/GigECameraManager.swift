@@ -42,19 +42,31 @@ import FramePipelineKit
     /// Preview consumer: drop-to-latest; cosmetic, never logged.
     private let previewSlot = LatestFrameSlot<PipelineFrame>()
     private let previewQueue = DispatchQueue(label: "com.lukechang.gigecamera.preview", qos: .userInitiated)
-    /// Invoked on `previewQueue` with the newest available frame.
-    public var onPreviewFrame: ((PipelineFrame) -> Void)?
 
     /// Stream consumer: bounded FIFO; drops are logged to the manifest.
     private let streamRing = BoundedFrameRing<PipelineFrame>(capacity: 6)
-    private let streamQueue = DispatchQueue(label: "com.lukechang.gigecamera.stream", qos: .userInitiated)
+    let streamQueue = DispatchQueue(label: "com.lukechang.gigecamera.stream", qos: .userInitiated)
+
+    // Lock protecting both frame-delivery closures.
+    private let callbackLock = NSLock()
+
+    private var _onPreviewFrame: ((PipelineFrame) -> Void)?
+    /// Invoked on `previewQueue` with the newest available frame.
+    public var onPreviewFrame: ((PipelineFrame) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onPreviewFrame }
+        set { callbackLock.lock(); defer { callbackLock.unlock() }; _onPreviewFrame = newValue }
+    }
+
+    private var _onStreamFrame: ((PipelineFrame) -> Bool)?
     /// Invoked on `streamQueue`; returns true if the frame was enqueued to the sink.
-    public var onStreamFrame: ((PipelineFrame) -> Bool)?
+    public var onStreamFrame: ((PipelineFrame) -> Bool)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }; return _onStreamFrame }
+        set { callbackLock.lock(); defer { callbackLock.unlock() }; _onStreamFrame = newValue }
+    }
 
     /// Sidecar manifest; non-nil only while a streaming session is active.
     private var manifestWriter: FrameManifestWriter?
     private let manifestLock = NSLock()
-    private var lastStreamFrameID: UInt64?
     
     
     override init() {
@@ -234,7 +246,6 @@ import FramePipelineKit
         let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
         let url = dir.appendingPathComponent("frames-\(stamp).csv")
         manifestWriter = try? FrameManifestWriter(url: url)
-        lastStreamFrameID = nil
         print("GigECameraManager: frame manifest -> \(url.path)")
     }
 
@@ -320,8 +331,9 @@ extension GigECameraManager: AravisBridgeDelegate {
         previewSlot.set(frame)
         previewQueue.async { [weak self] in
             guard let self, let latest = self.previewSlot.take() else { return }
+            let cb = self.onPreviewFrame      // locked read
             os_signpost(.begin, log: Self.signpostLog, name: "preview-render")
-            self.onPreviewFrame?(latest)
+            cb?(latest)
             os_signpost(.end, log: Self.signpostLog, name: "preview-render")
         }
 
@@ -331,11 +343,11 @@ extension GigECameraManager: AravisBridgeDelegate {
         }
         streamQueue.async { [weak self] in
             guard let self, let next = self.streamRing.pop() else { return }
+            let cb = self.onStreamFrame       // locked read
             os_signpost(.begin, log: Self.signpostLog, name: "stream-send")
-            let delivered = self.onStreamFrame?(next) ?? false
+            let delivered = cb?(next) ?? false
             os_signpost(.end, log: Self.signpostLog, name: "stream-send")
-            self.recordManifest(next.timestamp,
-                                status: delivered ? .delivered : .droppedQueue)
+            self.recordManifest(next.timestamp, status: delivered ? .delivered : .droppedQueue)
         }
     }
     

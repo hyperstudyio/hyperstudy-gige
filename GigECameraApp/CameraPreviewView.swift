@@ -73,45 +73,52 @@ struct CameraPreviewView: View {
 class FrameHandler: ObservableObject {
     @Published var currentImage: NSImage?
     @Published var fps: Double = 0.0
-    
+
     private var frameCount = 0
     private var lastFPSUpdate = Date()
     private let gigEManager = GigECameraManager.shared
-    
+
+    // Created once and reused. Color management disabled for the preview path:
+    // a live preview does not need colorimetric accuracy, and skipping it removes
+    // per-pixel gamma math. (Reusing the context is Apple's #1 Core Image perf rule.)
+    private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
+
+    // Preview is rendered downscaled; performance scales with output pixels.
+    private let maxPreviewWidth: CGFloat = 1280
+
     func startReceivingFrames() {
-        // Add frame handler to GigECameraManager
-        gigEManager.addFrameHandler { [weak self] pixelBuffer in
-            self?.handleFrame(pixelBuffer)
+        gigEManager.onPreviewFrame = { [weak self] frame in
+            self?.handleFrame(frame.pixelBuffer)
         }
     }
-    
+
     func stopReceivingFrames() {
-        gigEManager.removeAllFrameHandlers()
+        // Only detaches the preview. The stream path is independent and untouched.
+        gigEManager.onPreviewFrame = nil
     }
-    
+
+    /// Called on GigECameraManager.previewQueue (a background serial queue).
     private func handleFrame(_ pixelBuffer: CVPixelBuffer) {
-        // Update FPS
         frameCount += 1
         let now = Date()
         let elapsed = now.timeIntervalSince(lastFPSUpdate)
         if elapsed > 1.0 {
-            DispatchQueue.main.async {
-                self.fps = Double(self.frameCount) / elapsed
-            }
+            let fps = Double(frameCount) / elapsed
             frameCount = 0
             lastFPSUpdate = now
+            DispatchQueue.main.async { self.fps = fps }
         }
-        
-        // Convert CVPixelBuffer to NSImage
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext()
-        
-        if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
-            let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-            
-            DispatchQueue.main.async {
-                self.currentImage = nsImage
-            }
-        }
+
+        let source = CIImage(cvPixelBuffer: pixelBuffer)
+        let width = source.extent.width
+        let scale = width > maxPreviewWidth ? maxPreviewWidth / width : 1.0
+        let scaled = scale < 1.0
+            ? source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            : source
+
+        guard let cgImage = ciContext.createCGImage(scaled, from: scaled.extent) else { return }
+        let nsImage = NSImage(cgImage: cgImage,
+                              size: NSSize(width: cgImage.width, height: cgImage.height))
+        DispatchQueue.main.async { self.currentImage = nsImage }
     }
 }

@@ -9,6 +9,7 @@ import Foundation
 import SwiftUI
 import Combine
 import os.log
+import FramePipelineKit
 
 // UserDefaults extension for KVO
 extension UserDefaults {
@@ -702,7 +703,9 @@ class CameraManager: NSObject, ObservableObject {
         CVPixelBufferUnlockBaseAddress(testBuffer, [])
         
         logger.info("Sending test frame...")
-        sinkConnector.sendFrame(testBuffer)
+        let hostNs = DispatchTime.now().uptimeNanoseconds
+        let testTimestamp = FrameTimestamp(frameID: 0, cameraTimestampNs: 0, hostTimestampNs: hostNs)
+        sinkConnector.sendFrame(testBuffer, timestamp: testTimestamp)
     }
     
     private func showPreview() {
@@ -727,28 +730,14 @@ class CameraManager: NSObject, ObservableObject {
     
     // MARK: - Frame Handler Setup
     private func setupFrameHandler() {
-        // Set up frame handler to send frames to extension
+        // Stream consumer: runs on GigECameraManager.streamQueue (background).
+        // Capture the connector locally to avoid main-actor isolation in the
+        // closure; `sendFrame` self-guards on its own connection state and
+        // returns whether the frame was actually enqueued to the sink.
         let gigEManager = GigECameraManager.shared
-        gigEManager.addFrameHandler { [weak self] pixelBuffer in
-            guard let self = self else { return }
-            
-            // Send frame through CMIO sink if connected
-            if self.isFrameSenderConnected {
-                self.sinkConnector.sendFrame(pixelBuffer)
-                self.frameCount += 1
-                
-                // Log first frame and periodic updates
-                if self.frameCount == 1 {
-                    self.logger.info("First frame sent to CMIO sink!")
-                } else if self.frameCount % 300 == 0 {
-                    self.logger.info("Sent \(self.frameCount) frames to CMIO sink")
-                }
-            } else {
-                // Log why we're not sending
-                if self.frameCount % 30 == 0 {
-                    self.logger.warning("Not sending frames - isFrameSenderConnected = false")
-                }
-            }
+        let connector = self.sinkConnector
+        gigEManager.onStreamFrame = { frame in
+            return connector.sendFrame(frame.pixelBuffer, timestamp: frame.timestamp)
         }
         
         // Set up callbacks for automatic sink connection
@@ -816,16 +805,18 @@ class CameraManager: NSObject, ObservableObject {
             guard let self = self else { return }
             
             self.isFrameSenderConnected = connected
-            
+
             if connected {
+                GigECameraManager.shared.startManifest()
                 self.logger.info("✅ Sink connector connected via property listener callback!")
-                
+
                 // Start Aravis streaming if camera is connected but not streaming
                 if self.isConnected && !GigECameraManager.shared.isStreaming {
                     self.logger.info("Starting Aravis streaming after sink connection")
                     GigECameraManager.shared.startStreaming()
                 }
             } else {
+                GigECameraManager.shared.stopManifest()
                 self.logger.warning("⚠️ Sink connector disconnected")
             }
         }

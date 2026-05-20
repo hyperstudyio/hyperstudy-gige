@@ -10,6 +10,7 @@ import CoreMediaIO
 import CoreVideo
 import AVFoundation
 import os.log
+import FramePipelineKit
 
 // MARK: - Stream State Monitor
 
@@ -296,32 +297,33 @@ class CMIOSinkConnector {
         onSinkStreamAvailable?(false)
     }
     
-    func sendFrame(_ pixelBuffer: CVPixelBuffer) {
+    @discardableResult
+    func sendFrame(_ pixelBuffer: CVPixelBuffer, timestamp: FrameTimestamp) -> Bool {
         guard isConnected, let queue = sinkQueue else {
             if frameCount % 30 == 0 {
                 logger.warning("Cannot send frame - not connected to sink")
             }
-            return
+            return false
         }
-        
+
         // Convert BGRA to YUV420 for video streaming (also scales to HD if needed)
         guard let yuvBuffer = pixelBufferConverter.convertToHD(pixelBuffer) else {
             logger.error("Failed to convert pixel buffer to YUV")
-            return
+            return false
         }
-        
+
         // Create CMSampleBuffer from converted pixel buffer
-        guard let sampleBuffer = createSampleBuffer(from: yuvBuffer) else {
+        guard let sampleBuffer = createSampleBuffer(from: yuvBuffer, timestamp: timestamp) else {
             logger.error("Failed to create sample buffer from pixel buffer")
-            return
+            return false
         }
-        
+
         // Enqueue the buffer
         let result = CMSimpleQueueEnqueue(queue, element: Unmanaged.passRetained(sampleBuffer).toOpaque())
-        
+
         if result == noErr {
             frameCount += 1
-            
+
             // Log periodically
             if frameCount % 30 == 0 {
                 let width = CVPixelBufferGetWidth(yuvBuffer)
@@ -331,25 +333,15 @@ class CMIOSinkConnector {
                 logger.info("📤 Sent frame #\(self.frameCount) to sink | \(width)x\(height) | Format: \(formatString)")
             }
         } else {
-            // Handle specific error cases
             switch result {
-            case kCMSimpleQueueError_AllocationFailed:
-                logger.error("Queue allocation failed - queue may be full")
-            case kCMSimpleQueueError_RequiredParameterMissing:
-                logger.error("Required parameter missing")
-            case kCMSimpleQueueError_ParameterOutOfRange:
-                logger.error("Parameter out of range")
             case kCMSimpleQueueError_QueueIsFull:
                 logger.warning("Queue is full - dropping frame")
             default:
                 logger.error("Failed to enqueue buffer: \(result)")
             }
-            
-            // If we get repeated errors, it might indicate a connection problem
-            if result != kCMSimpleQueueError_QueueIsFull && result != noErr {
-                logger.warning("Enqueue error may indicate connection issue")
-            }
+            return false
         }
+        return true
     }
     
     // MARK: - Private Methods
@@ -386,7 +378,8 @@ class CMIOSinkConnector {
         }
     }
     
-    private func createSampleBuffer(from pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
+    private func createSampleBuffer(from pixelBuffer: CVPixelBuffer,
+                                    timestamp: FrameTimestamp) -> CMSampleBuffer? {
         // Create format description
         var formatDescription: CMVideoFormatDescription?
         let formatResult = CMVideoFormatDescriptionCreateForImageBuffer(
@@ -400,10 +393,13 @@ class CMIOSinkConnector {
             return nil
         }
         
-        // Create timing info
+        // Use the capture-time host timestamp (CLOCK_UPTIME_RAW ns, same mach
+        // timebase as the host time clock) so the presentation timeline reflects
+        // when the frame was captured — not when it happened to be processed.
         var timingInfo = CMSampleTimingInfo(
             duration: CMTime.invalid,
-            presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+            presentationTimeStamp: CMTimeMake(value: Int64(timestamp.hostTimestampNs),
+                                              timescale: 1_000_000_000),
             decodeTimeStamp: CMTime.invalid
         )
         

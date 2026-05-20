@@ -8,6 +8,7 @@
 import Foundation
 import CoreVideo
 import Combine
+import FramePipelineKit
 
 // Using stub implementation for now
 // When Aravis is properly integrated, remove the stub

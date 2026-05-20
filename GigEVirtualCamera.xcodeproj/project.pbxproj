@@ -16,7 +16,6 @@
 		5167D3DB450F7851540C99AD /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 3B5293ECB1444D7DF3843CA6 /* Assets.xcassets */; };
 		56F45446257DB667908E2553 /* GigECameraApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A19F5AC376905E28D984426A /* GigECameraApp.swift */; };
 		60AB199939003528FBAC0F1D /* CameraConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4656E7ADCED50BC389B7E7C7 /* CameraConstants.swift */; };
-		78A8516529854A979EA71BDB /* CameraPreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15570879E141C8029D5D2E9 /* CameraPreviewView.swift */; };
 		7FB68897794C86621A4AE2B3 /* CMIOExtensionProperties.swift in Sources */ = {isa = PBXBuildFile; fileRef = A84F71AC554427A9375C99C8 /* CMIOExtensionProperties.swift */; };
 		81F05D49548AF55D7ADC4227 /* GigECameraManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA0D776346DD1FED961B677F /* GigECameraManager.swift */; };
 		91AC552492FCCD5F93B1787C /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25B0B794181488800BEAEB3A /* ContentView.swift */; };
@@ -83,7 +82,6 @@
 		A19F5AC376905E28D984426A /* GigECameraApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GigECameraApp.swift; sourceTree = "<group>"; };
 		A84F71AC554427A9375C99C8 /* CMIOExtensionProperties.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CMIOExtensionProperties.swift; sourceTree = "<group>"; };
 		AF6BE2633D6C2FA2CC3E89C2 /* NetworkInterfaceMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkInterfaceMonitor.swift; sourceTree = "<group>"; };
-		B15570879E141C8029D5D2E9 /* CameraPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreviewView.swift; sourceTree = "<group>"; };
 		C024BFEF3CAF28E089A772F0 /* CMIOPropertyListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CMIOPropertyListener.swift; sourceTree = "<group>"; };
 		C0ABA500E74E58DA7AAFCC94 /* IOSurfaceFrameSharing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSurfaceFrameSharing.swift; sourceTree = "<group>"; };
 		CF57E68AAC8B26D08650A0DF /* GigECamera-Release.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "GigECamera-Release.entitlements"; sourceTree = "<group>"; };
@@ -114,7 +112,6 @@
 				3B5293ECB1444D7DF3843CA6 /* Assets.xcassets */,
 				4656E7ADCED50BC389B7E7C7 /* CameraConstants.swift */,
 				08987548898558EC7975B0D2 /* CameraManager.swift */,
-				B15570879E141C8029D5D2E9 /* CameraPreviewView.swift */,
 				43D9C615FB22B5ADC5572BA6 /* CMIOFrameSender.swift */,
 				C024BFEF3CAF28E089A772F0 /* CMIOPropertyListener.swift */,
 				25B0B794181488800BEAEB3A /* ContentView.swift */,
@@ -372,7 +369,6 @@
 				33458ADE303266E36DE5CBE8 /* CMIOPropertyListener.swift in Sources */,
 				60AB199939003528FBAC0F1D /* CameraConstants.swift in Sources */,
 				DF218341570648066EE4D859 /* CameraManager.swift in Sources */,
-				78A8516529854A979EA71BDB /* CameraPreviewView.swift in Sources */,
 				91AC552492FCCD5F93B1787C /* ContentView.swift in Sources */,
 				E9261B5C4B76BFF0975319CE /* DesignSystem.swift in Sources */,
 				FC594C358FDF42D7C703E7C7 /* ExtensionManager.swift in Sources */,

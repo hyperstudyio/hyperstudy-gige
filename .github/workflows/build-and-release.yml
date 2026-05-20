@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  actions: write  # required for the "Trigger docs release-notes sync" step to dispatch the Sync workflow via GITHUB_TOKEN
 
 jobs:
   build-and-release:

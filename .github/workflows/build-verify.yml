@@ -1,0 +1,42 @@
+name: Build Verify (unsigned)
+
+# Compile/link verification for the macOS app. Signing is intentionally disabled:
+# the dev certs and provisioning profiles live only as GitHub secrets used by the
+# tagged release workflow, and these changes are pure code. This job confirms the
+# app, the Obj-C++ Aravis bridge, and the linked FramePipelineKit package all
+# compile and link. It needs no secrets.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-verify:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Aravis
+        run: |
+          brew update
+          brew install aravis
+          pkg-config --modversion aravis-0.8
+
+      - name: Unsigned compile build
+        run: |
+          ARAVIS_PREFIX="/opt/homebrew/opt/aravis"
+          GLIB_PREFIX="/opt/homebrew/opt/glib"
+          GETTEXT_PREFIX="/opt/homebrew/opt/gettext"
+          PCRE2_PREFIX="/opt/homebrew/opt/pcre2"
+
+          xcodebuild -project GigEVirtualCamera.xcodeproj \
+            -scheme GigEVirtualCamera \
+            -configuration Debug \
+            -derivedDataPath build/verify \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            HEADER_SEARCH_PATHS="/opt/homebrew/include ${ARAVIS_PREFIX}/include/aravis-0.8 ${GLIB_PREFIX}/include ${GLIB_PREFIX}/include/glib-2.0 ${GLIB_PREFIX}/lib/glib-2.0/include ${GETTEXT_PREFIX}/include ${PCRE2_PREFIX}/include /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/ffi" \
+            LIBRARY_SEARCH_PATHS="/opt/homebrew/lib ${ARAVIS_PREFIX}/lib" \
+            build

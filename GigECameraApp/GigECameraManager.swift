@@ -8,6 +8,7 @@
 import Foundation
 import CoreVideo
 import Combine
+import os.signpost
 import FramePipelineKit
 
 // Using stub implementation for now
@@ -27,6 +28,9 @@ import FramePipelineKit
     private let aravisBridge = AravisBridge()
     private var lastDiscoveryTime = Date.distantPast
     private var connectionRetryCount = 0
+
+    private static let signpostLog = OSLog(subsystem: "com.lukechang.GigEVirtualCamera",
+                                           category: "FramePipeline")
 
     // MARK: - Frame fan-out
     /// One frame plus its capture-time identity, passed to both consumers.
@@ -316,7 +320,9 @@ extension GigECameraManager: AravisBridgeDelegate {
         previewSlot.set(frame)
         previewQueue.async { [weak self] in
             guard let self, let latest = self.previewSlot.take() else { return }
+            os_signpost(.begin, log: Self.signpostLog, name: "preview-render")
             self.onPreviewFrame?(latest)
+            os_signpost(.end, log: Self.signpostLog, name: "preview-render")
         }
 
         // Stream: bounded buffer; a displaced frame is a logged buffer-drop.
@@ -325,7 +331,9 @@ extension GigECameraManager: AravisBridgeDelegate {
         }
         streamQueue.async { [weak self] in
             guard let self, let next = self.streamRing.pop() else { return }
+            os_signpost(.begin, log: Self.signpostLog, name: "stream-send")
             let delivered = self.onStreamFrame?(next) ?? false
+            os_signpost(.end, log: Self.signpostLog, name: "stream-send")
             self.recordManifest(next.timestamp,
                                 status: delivered ? .delivered : .droppedQueue)
         }

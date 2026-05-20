@@ -7,6 +7,8 @@
 
 import SwiftUI
 import IOSurface
+import CoreImage
+import AppKit
 
 struct ContentView: View {
     @EnvironmentObject var cameraManager: CameraManager
@@ -654,7 +656,12 @@ class PreviewFrameHandler: ObservableObject {
     @Published var currentImage: NSImage?
     private let gigEManager = GigECameraManager.shared
     private var frameCount = 0
-    
+
+    // Reused once; color management disabled (a live preview needs no colorimetric
+    // accuracy). Reusing the CIContext is Apple's #1 Core Image performance rule.
+    private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
+    private let maxPreviewWidth: CGFloat = 1280
+
     
     func startReceivingFrames() {
         print("PreviewFrameHandler: Starting to receive frames")
@@ -686,27 +693,22 @@ class PreviewFrameHandler: ObservableObject {
         // Use the preview slot callback (drop-to-latest, independent of stream path).
         gigEManager.onPreviewFrame = { [weak self] frame in
             guard let self = self else { return }
-
             self.frameCount += 1
 
-            // Only log every 30th frame
-            if self.frameCount % 30 == 1 {
-                print("PreviewFrameHandler: Got frame #\(self.frameCount)")
-            }
+            // Runs on GigECameraManager.previewQueue (background serial queue).
+            // Render at preview size with the reused context; only the image
+            // assignment touches the main thread.
+            let source = CIImage(cvPixelBuffer: frame.pixelBuffer)
+            let width = source.extent.width
+            let scale = width > self.maxPreviewWidth ? self.maxPreviewWidth / width : 1.0
+            let scaled = scale < 1.0
+                ? source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                : source
+            guard let cgImage = self.ciContext.createCGImage(scaled, from: scaled.extent) else { return }
+            let nsImage = NSImage(cgImage: cgImage,
+                                  size: NSSize(width: cgImage.width, height: cgImage.height))
 
-            // Simple CIImage to NSImage conversion (runs on previewQueue)
-            let ciImage = CIImage(cvPixelBuffer: frame.pixelBuffer)
-            let rep = NSCIImageRep(ciImage: ciImage)
-            let nsImage = NSImage(size: rep.size)
-            nsImage.addRepresentation(rep)
-
-            // Update on main thread
-            DispatchQueue.main.async {
-                self.currentImage = nsImage
-                if self.frameCount % 30 == 1 {
-                    print("PreviewFrameHandler: Updated UI with frame #\(self.frameCount)")
-                }
-            }
+            DispatchQueue.main.async { self.currentImage = nsImage }
         }
 
         print("PreviewFrameHandler: Frame handler added")
@@ -714,7 +716,8 @@ class PreviewFrameHandler: ObservableObject {
 
     func stopReceivingFrames() {
         print("PreviewFrameHandler: Stopping frame reception after \(frameCount) frames")
-        gigEManager.stopStreaming()
+        // Detach the preview only. The stream path is independent and must keep
+        // running for any recording consumer, so do NOT stop streaming here.
         gigEManager.onPreviewFrame = nil
         frameCount = 0
     }

@@ -4,6 +4,10 @@
 //
 //  Camera preview window
 //
+// NOTE: UNUSED. The live preview is `CameraPreviewSection` / `PreviewFrameHandler`
+// in ContentView.swift. This view is compiled but never instantiated. Do not wire
+// it up without first resolving that both it and PreviewFrameHandler assign the
+// single GigECameraManager.onPreviewFrame closure (they would clobber each other).
 
 import SwiftUI
 import CoreVideo

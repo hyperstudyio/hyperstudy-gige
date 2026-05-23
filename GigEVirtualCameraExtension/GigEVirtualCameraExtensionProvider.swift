@@ -267,11 +267,18 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
     
     private let logger = Logger(subsystem: "com.lukechang.GigEVirtualCamera.Extension", category: "SourceStream")
     
-    // Default frame generation
+    // Default-frame fallback. The `timer` is a 2-second watchdog that emits a
+    // default frame ONLY when no real frame has been delivered recently. It is
+    // NOT a 30 Hz generator. Mixing two frame sources at 30 Hz interleaves PTS
+    // values that originate from different paths and makes CMIO clients freeze.
     private var timer: Timer?
     private var defaultPixelBuffer: CVPixelBuffer?
     private let frameDuration = CMTime(value: 1, timescale: 30)  // 30 fps
-    
+
+    // Mach-uptime ns of the last real (non-default) frame successfully sent.
+    // The watchdog suppresses itself while this is fresh (< 2s old).
+    private var lastRealFrameUptimeNs: UInt64 = 0
+
     // Keep reference to last frame for new clients
     private var lastReceivedFrame: CMSampleBuffer?
     private let frameQueue = DispatchQueue(label: "com.lukechang.lastframe", qos: .userInteractive)
@@ -294,19 +301,11 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
         createDefaultPixelBuffer()
         
         logger.info("Source stream initialized: \(localizedName)")
-        
-        // Start sending default frames immediately to ensure Photo Booth can see them
-        NSLog("🎬🎬🎬 Starting default frame timer immediately on init")
-        logger.info("Starting default frame timer immediately to ensure frames are available")
-        
-        // Start immediately, don't wait
-        startDefaultFrameTimer()
-        
-        // Also send a test frame right away
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            NSLog("🎬🎬🎬 Sending initial test frame")
-            self?.sendDefaultFrame()
-        }
+
+        // Default-frame emission is started by startStream(), not here. There
+        // are no clients at init time and emitting frames before then is wasted
+        // work that previously corrupted live streams by interleaving with the
+        // real-frame path on a different clock domain.
     }
     
     var formats: [CMIOExtensionStreamFormat] {
@@ -396,27 +395,30 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
         
         // Notify device source
         deviceSource.startStreaming()
-        
+
         NSLog("🎬🎬🎬 Current streamingCounter AFTER increment: \(deviceSource.streamingCounter)")
-        
-        // Start timer for default frames (when sink not active)
-        logger.info("Starting default frame timer...")
-        NSLog("🎬🎬🎬 Starting default frame timer")
-        startDefaultFrameTimer()
-        
-        // IMPORTANT: Send last frame immediately if we have one
-        // This ensures new clients see video right away instead of black screen
+
+        // Start the 2-second no-real-frame watchdog. This is the ONLY scheduled
+        // emission path for default frames. The previous 30Hz timer raced the
+        // real-frame path and caused stuck/frozen video in clients.
+        logger.info("Starting no-frame watchdog...")
+        startNoFrameWatchdog()
+
+        // One-shot bootstrap so freshly connected clients see something instead
+        // of black. Prefer the last real frame; otherwise emit the test pattern.
+        // Marked isDefault so this does not suppress the watchdog -- if no real
+        // frames arrive within 2s, the watchdog still kicks in.
         frameQueue.async { [weak self] in
-            if let lastFrame = self?.lastReceivedFrame {
-                NSLog("🎬🎬🎬 Sending last received frame to new client immediately")
-                self?.logger.info("Sending cached frame to new client")
-                DispatchQueue.main.async {
-                    self?.sendSampleBuffer(lastFrame)
-                }
-            } else {
-                NSLog("🎬🎬🎬 No cached frame available, sending default frame")
-                DispatchQueue.main.async {
-                    self?.sendDefaultFrame()
+            guard let self = self else { return }
+            let bootstrap = self.lastReceivedFrame
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if let bootstrap = bootstrap {
+                    self.logger.info("Bootstrap: sending cached real frame to new client")
+                    self.sendSampleBuffer(bootstrap, isDefault: true)
+                } else {
+                    self.logger.info("Bootstrap: no cached frame, sending default test pattern")
+                    self.sendDefaultFrame()
                 }
             }
         }
@@ -428,63 +430,50 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
         }
         
         logger.info("Stopping source stream")
-        
-        // Stop timer
-        stopDefaultFrameTimer()
-        
+
+        // Stop watchdog
+        stopNoFrameWatchdog()
+
         // Notify device source
         deviceSource.stopStreaming()
     }
     
-    // Public method for DeviceSource to send frames
-    func sendSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-        NSLog("📺📺📺 ENTERED SourceStreamSource.sendSampleBuffer")
-        
-        // Check if stream is nil
+    // Public method for DeviceSource to send frames.
+    //
+    // `isDefault == true` means the test-pattern or bootstrap path. Default
+    // frames are NOT cached as `lastReceivedFrame` (we don't want the test
+    // pattern to become the next bootstrap) and they do NOT update
+    // `lastRealFrameUptimeNs` (so the watchdog stays armed).
+    //
+    // `hostTimeInNanoseconds` MUST be drawn from a single monotonic clock
+    // (CLOCK_UPTIME_RAW, the same source the app's capture path uses) for both
+    // real and default frames. Mixing CMSampleBuffer PTS (capture time) with
+    // host-time clock (send time) is what previously made CMIO clients freeze
+    // on non-monotonic timestamps.
+    func sendSampleBuffer(_ sampleBuffer: CMSampleBuffer, isDefault: Bool = false) {
         if stream == nil {
-            NSLog("❌❌❌ stream is NIL in sendSampleBuffer!")
             logger.error("stream is nil - cannot send frame")
             return
         }
-        
-        // Cache this frame for new clients
-        frameQueue.async { [weak self] in
-            self?.lastReceivedFrame = sampleBuffer
+
+        // Cache real frames only.
+        if !isDefault {
+            frameQueue.async { [weak self] in
+                self?.lastReceivedFrame = sampleBuffer
+            }
         }
-        
-        // Use the sample buffer's own timing instead of overriding it
-        var timingInfo = CMSampleTimingInfo()
-        var timingInfoCount: CMItemCount = 0
-        CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &timingInfoCount)
-        
-        if timingInfoCount > 0 {
-            CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 1, arrayToFill: &timingInfo, entriesNeededOut: nil)
-            let hostTime = CMTimeConvertScale(timingInfo.presentationTimeStamp, timescale: Int32(NSEC_PER_SEC), method: .default)
-            
-            NSLog("📺📺📺 SourceStreamSource.sendSampleBuffer called - using buffer's timing")
-            logger.debug("🚀 Source sending frame to clients | buffer time: \(timingInfo.presentationTimeStamp.seconds)")
-            
-            stream.send(
-                sampleBuffer,
-                discontinuity: [],
-                hostTimeInNanoseconds: UInt64(hostTime.value)
-            )
-        } else {
-            // Fallback to current time if no timing info
-            let now = CMClockGetTime(CMClockGetHostTimeClock())
-            
-            NSLog("📺📺📺 SourceStreamSource.sendSampleBuffer called - using current time")
-            logger.debug("🚀 Source sending frame to clients | current time: \(now.seconds)")
-            
-            stream.send(
-                sampleBuffer,
-                discontinuity: [],
-                hostTimeInNanoseconds: UInt64(now.seconds * Double(NSEC_PER_SEC))
-            )
+
+        let hostTimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+
+        stream.send(
+            sampleBuffer,
+            discontinuity: [],
+            hostTimeInNanoseconds: hostTimeNs
+        )
+
+        if !isDefault {
+            lastRealFrameUptimeNs = hostTimeNs
         }
-        
-        logger.debug("✅ Frame sent to source stream")
-        NSLog("📺📺📺 Frame sent to CMIO source stream")
     }
     
     private func createDefaultPixelBuffer() {
@@ -544,56 +533,60 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
         }
     }
     
-    private func startDefaultFrameTimer() {
-        NSLog("📐📐📐 startDefaultFrameTimer called")
+    // 2s no-real-frame watchdog. Emits one default frame only when no real
+    // frame has been delivered in the last 2 seconds. Replaces the previous
+    // always-on 30 Hz default-frame generator that was the root cause of
+    // frozen/stuck client video.
+    private static let noFrameTimeoutNs: UInt64 = 2_000_000_000
+
+    private func startNoFrameWatchdog() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0/30.0, repeats: true) { [weak self] _ in
-            self?.sendDefaultFrame()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            let last = self.lastRealFrameUptimeNs
+            if last == 0 || now - last > Self.noFrameTimeoutNs {
+                self.sendDefaultFrame()
+            }
         }
-        NSLog("📐📐📐 Default frame timer scheduled - timer: \(timer != nil)")
     }
-    
-    private func stopDefaultFrameTimer() {
+
+    private func stopNoFrameWatchdog() {
         timer?.invalidate()
         timer = nil
     }
     
     private func sendDefaultFrame() {
-        guard let deviceSource = device.source as? GigEVirtualCameraExtensionDeviceSource else { return }
-        
-        // Always send frames to ensure Photo Booth can connect
-        // Real frames from sink will override these when available
-        if let buffer = defaultPixelBuffer {
-            // Create sample buffer
-            var sampleBuffer: CMSampleBuffer?
-            var timingInfo = CMSampleTimingInfo(
-                duration: frameDuration,
-                presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
-                decodeTimeStamp: .invalid
-            )
-            
-            var formatDesc: CMVideoFormatDescription?
-            CMVideoFormatDescriptionCreateForImageBuffer(
-                allocator: kCFAllocatorDefault,
-                imageBuffer: buffer,
-                formatDescriptionOut: &formatDesc
-            )
-            
-            CMSampleBufferCreateReadyWithImageBuffer(
-                allocator: kCFAllocatorDefault,
-                imageBuffer: buffer,
-                formatDescription: formatDesc!,
-                sampleTiming: &timingInfo,
-                sampleBufferOut: &sampleBuffer
-            )
-            
-            if let sample = sampleBuffer {
-                // Log periodically to avoid spam
-                if Int.random(in: 0..<30) == 0 {  // Log ~1 per second at 30fps
-                    NSLog("📐📐📐 Sending default test pattern frame")
-                }
-                sendSampleBuffer(sample)
-            }
+        guard let _ = device.source as? GigEVirtualCameraExtensionDeviceSource else { return }
+        guard let buffer = defaultPixelBuffer else { return }
+
+        var sampleBuffer: CMSampleBuffer?
+        var timingInfo = CMSampleTimingInfo(
+            duration: frameDuration,
+            presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+            decodeTimeStamp: .invalid
+        )
+
+        var formatDesc: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescriptionOut: &formatDesc
+        )
+
+        guard let format = formatDesc else { return }
+
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescription: format,
+            sampleTiming: &timingInfo,
+            sampleBufferOut: &sampleBuffer
+        )
+
+        if let sample = sampleBuffer {
+            logger.info("Watchdog emitting default frame -- no real frame in last 2s")
+            sendSampleBuffer(sample, isDefault: true)
         }
     }
 }

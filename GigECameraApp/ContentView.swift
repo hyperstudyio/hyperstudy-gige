@@ -9,6 +9,7 @@ import SwiftUI
 import IOSurface
 import CoreImage
 import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject var cameraManager: CameraManager
@@ -287,7 +288,7 @@ struct ContentView: View {
                                 value: cameraManager.isFrameSenderConnected ? "Connected" : "Waiting...",
                                 valueColor: cameraManager.isFrameSenderConnected ? .green : .orange
                             )
-                            
+
                             // Add retry button if sink is not connected
                             if !cameraManager.isFrameSenderConnected {
                                 Button(action: {
@@ -301,6 +302,17 @@ struct ContentView: View {
                                 .help("Retry sink connection")
                             }
                         }
+                    }
+
+                    // Loud banner when the stream-stall watchdog detects frames
+                    // have stopped flowing. This is the signal that says "your
+                    // run is silently losing data right now" -- visually
+                    // unmissable on purpose.
+                    if cameraManager.streamStalled {
+                        StreamStalledBanner(
+                            durationSec: cameraManager.streamStallDurationSec,
+                            onRecover: { cameraManager.retryFrameSenderConnection() }
+                        )
                     }
                     
                     // Show camera info during connection attempts too
@@ -515,6 +527,12 @@ struct ContentView: View {
                                 ))
                                 .animation(.easeInOut(duration: 0.3), value: cameraManager.isShowingPreview)
                         }
+
+                        // Diagnostics drawer: lets users turn on live debug
+                        // logging and export a txt/json report for us to triage.
+                        DiagnosticsDrawer()
+                            .environmentObject(cameraManager)
+                            .padding(.top, DesignSystem.Spacing.medium)
                     }
                 }
                 .padding(.horizontal, DesignSystem.Spacing.large)
@@ -569,20 +587,65 @@ struct StatusRow: View {
     let title: String
     let value: String
     var valueColor: Color = DesignSystem.Colors.textPrimary
-    
+
     var body: some View {
         HStack {
             Label(title, systemImage: icon)
                 .font(DesignSystem.Typography.callout)
                 .foregroundColor(DesignSystem.Colors.textSecondary)
-            
+
             Spacer()
-            
+
             Text(value)
                 .font(DesignSystem.Typography.callout)
                 .fontWeight(.medium)
                 .foregroundColor(valueColor)
         }
+    }
+}
+
+// MARK: - Stream Stalled Banner
+
+/// Surfaces the stream-stall watchdog state. The user MUST see this if frames
+/// have stopped flowing -- silent failure during an fMRI scan invalidates data.
+struct StreamStalledBanner: View {
+    let durationSec: Double
+    let onRecover: () -> Void
+
+    private var durationText: String {
+        String(format: "%.1f", durationSec)
+    }
+
+    var body: some View {
+        HStack(spacing: DesignSystem.Spacing.small) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundColor(.white)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Stream stalled — frames not flowing")
+                    .font(DesignSystem.Typography.callout)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.white)
+                Text("No frame has been delivered in \(durationText)s. Recording may be losing data.")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(.white.opacity(0.9))
+            }
+            Spacer()
+            Button(action: onRecover) {
+                Text("Reconnect")
+                    .font(DesignSystem.Typography.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.red)
+                    .padding(.horizontal, DesignSystem.Spacing.small)
+                    .padding(.vertical, 4)
+                    .background(Color.white)
+                    .cornerRadius(DesignSystem.CornerRadius.small)
+            }
+            .buttonStyle(PlainButtonStyle())
+        }
+        .padding(DesignSystem.Spacing.medium)
+        .background(Color.red)
+        .cornerRadius(DesignSystem.CornerRadius.medium)
     }
 }
 
@@ -614,7 +677,7 @@ struct CameraPreviewSection: View {
             // Background
             RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
                 .fill(Color.black)
-            
+
             if let image = frameHandler.currentImage {
                 Image(nsImage: image)
                     .resizable()
@@ -632,15 +695,33 @@ struct CameraPreviewSection: View {
                         .padding(.top, DesignSystem.Spacing.small)
                 }
             }
+
+            // Stall overlay. We deliberately keep `currentImage` visible
+            // beneath this so the user sees the last good frame, not black.
+            if frameHandler.previewStalled {
+                VStack {
+                    HStack(spacing: DesignSystem.Spacing.xSmall) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.black)
+                        Text("Preview stalled — last frame frozen")
+                            .font(DesignSystem.Typography.caption)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.black)
+                    }
+                    .padding(.horizontal, DesignSystem.Spacing.small)
+                    .padding(.vertical, DesignSystem.Spacing.xSmall)
+                    .background(Color.yellow)
+                    .cornerRadius(DesignSystem.CornerRadius.small)
+                    .padding(.top, DesignSystem.Spacing.small)
+                    Spacer()
+                }
+            }
         }
         .frame(height: 300)
         .onAppear {
             print("CameraPreviewSection: ===== VIEW APPEARED =====")
             hasAppeared = true
-            // Delay to ensure view is stable
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                frameHandler.startReceivingFrames()
-            }
+            frameHandler.startReceivingFrames()
         }
         .onDisappear {
             print("CameraPreviewSection: ===== VIEW DISAPPEARED =====")
@@ -654,6 +735,17 @@ struct CameraPreviewSection: View {
 
 class PreviewFrameHandler: ObservableObject {
     @Published var currentImage: NSImage?
+    /// True when the preview has gone stale (no new frame for >2s while the
+    /// camera reports it is streaming) but the camera previously delivered at
+    /// least one frame. Surfaces a banner over the last good image instead of
+    /// silently going black.
+    @Published var previewStalled = false
+    /// Mach-uptime ns of the last successful image assignment. 0 until the
+    /// first frame is rendered.
+    private var lastPreviewUptimeNs: UInt64 = 0
+    private var stallWatchdog: Timer?
+    private static let previewStallTimeoutNs: UInt64 = 2_000_000_000
+
     private let gigEManager = GigECameraManager.shared
     private var frameCount = 0
 
@@ -662,28 +754,52 @@ class PreviewFrameHandler: ObservableObject {
     private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
     private let maxPreviewWidth: CGFloat = 1280
 
-    
-    func startReceivingFrames() {
-        print("PreviewFrameHandler: Starting to receive frames")
-        
-        // Check if camera is connected first
-        guard gigEManager.isConnected else {
-            print("PreviewFrameHandler: Camera not connected, cannot start preview")
+    init() {
+        // Wire onPreviewFrame at construction time, BEFORE any frame can arrive.
+        // The previous design only assigned the callback after an asyncAfter
+        // delay (and only if the camera was already connected); if the preview
+        // view appeared during camera reconnect, the callback was never set and
+        // the preview stayed black until the user toggled Hide/Show.
+        setupFrameHandler()
+        startStallWatchdog()
+    }
+
+    deinit {
+        stallWatchdog?.invalidate()
+    }
+
+    private func startStallWatchdog() {
+        stallWatchdog?.invalidate()
+        stallWatchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.tickStallWatchdog()
+        }
+    }
+
+    private func tickStallWatchdog() {
+        // Only meaningful while we've previously rendered at least one frame
+        // AND the camera reports it should be streaming. Otherwise the absence
+        // of frames is expected (e.g. preview hidden, camera not connected) and
+        // surfacing a "stalled" banner would be misleading.
+        guard lastPreviewUptimeNs != 0, gigEManager.isStreaming else {
+            if previewStalled { previewStalled = false }
             return
         }
-        
-        // Start streaming if not already
+        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let stale = (now &- lastPreviewUptimeNs) > Self.previewStallTimeoutNs
+        if stale != previewStalled {
+            previewStalled = stale
+        }
+    }
+
+    func startReceivingFrames() {
+        print("PreviewFrameHandler: Starting to receive frames")
+        // The callback is already registered from init(). All we do here is
+        // make sure the camera is streaming so frames actually flow.
         if !gigEManager.isStreaming {
             print("PreviewFrameHandler: Starting streaming...")
             gigEManager.startStreaming()
-            
-            // Give it a moment to start
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.setupFrameHandler()
-            }
         } else {
             print("PreviewFrameHandler: Already streaming")
-            setupFrameHandler()
         }
     }
     
@@ -708,7 +824,12 @@ class PreviewFrameHandler: ObservableObject {
             let nsImage = NSImage(cgImage: cgImage,
                                   size: NSSize(width: cgImage.width, height: cgImage.height))
 
-            DispatchQueue.main.async { self.currentImage = nsImage }
+            let nowUptime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            DispatchQueue.main.async {
+                self.currentImage = nsImage
+                self.lastPreviewUptimeNs = nowUptime
+                if self.previewStalled { self.previewStalled = false }
+            }
         }
 
         print("PreviewFrameHandler: Frame handler added")
@@ -720,6 +841,212 @@ class PreviewFrameHandler: ObservableObject {
         // running for any recording consumer, so do NOT stop streaming here.
         gigEManager.onPreviewFrame = nil
         frameCount = 0
+    }
+}
+
+// MARK: - Diagnostics Drawer
+
+/// Collapsible drawer showing recent in-process log entries and a state
+/// snapshot. Two export buttons write the same data to `.txt` or `.json` so
+/// users can email us a report when something goes wrong during a scan.
+///
+/// Live mode is OFF by default. When ON, the underlying `DiagnosticsLog`
+/// polls `OSLogStore` every 1 s. When OFF, the drawer still shows the most
+/// recent snapshot, but it doesn't keep growing.
+struct DiagnosticsDrawer: View {
+    @EnvironmentObject var cameraManager: CameraManager
+    @ObservedObject private var log = DiagnosticsLog.shared
+    @State private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.small) {
+                Toggle(isOn: liveBinding) {
+                    HStack(spacing: DesignSystem.Spacing.xSmall) {
+                        Image(systemName: log.isLive ? "dot.radiowaves.left.and.right" : "pause.circle")
+                            .foregroundColor(log.isLive ? .green : .gray)
+                        Text("Live debugging")
+                            .font(DesignSystem.Typography.callout)
+                        Text(log.isLive ? "(polling this app's log every 1 s)" : "(off)")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.textSecondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                // Scope disclosure: OSLogStore(.currentProcessIdentifier) only
+                // returns this process's log entries. The Camera Extension is
+                // a separate process and its log isn't captured here. The
+                // state-snapshot section of the export DOES reflect extension
+                // health (sink connected, stream stalled, PTS nudges) via the
+                // app/extension shared state, so reports remain triageable.
+                Text("Captures this app only — Camera Extension runs in a separate process and its log isn't included. The state snapshot section of the export still reflects extension health.")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(DesignSystem.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                logScroll
+
+                HStack(spacing: DesignSystem.Spacing.small) {
+                    Button("Refresh") { log.loadInitialSnapshot() }
+                    Button("Clear") { log.clear() }
+                    Spacer()
+                    Button("Copy to clipboard") { copyToPasteboard() }
+                    Button("Export .txt") { exportTxt() }
+                    Button("Export .json") { exportJson() }
+                }
+                .font(DesignSystem.Typography.caption)
+            }
+            .padding(.top, DesignSystem.Spacing.small)
+        } label: {
+            HStack(spacing: DesignSystem.Spacing.xSmall) {
+                Image(systemName: "stethoscope")
+                Text("Diagnostics")
+                    .font(DesignSystem.Typography.callout)
+                    .fontWeight(.medium)
+                if log.isLive {
+                    Text("LIVE")
+                        .font(DesignSystem.Typography.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, DesignSystem.Spacing.xSmall)
+                        .padding(.vertical, 2)
+                        .background(Color.green)
+                        .cornerRadius(DesignSystem.CornerRadius.small)
+                }
+                Spacer()
+                if !log.entries.isEmpty {
+                    Text("\(log.entries.count) entries")
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                }
+            }
+        }
+        .onAppear { log.loadInitialSnapshot() }
+    }
+
+    private var liveBinding: Binding<Bool> {
+        Binding(
+            get: { log.isLive },
+            set: { newValue in
+                if newValue { log.startLive() } else { log.stopLive() }
+            }
+        )
+    }
+
+    private var logScroll: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    if log.entries.isEmpty {
+                        Text("No log entries yet. Turn on Live debugging to start capturing, or click Refresh to load the last 5 minutes.")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(.gray)
+                            .padding(DesignSystem.Spacing.small)
+                    } else {
+                        ForEach(log.entries) { entry in
+                            DiagnosticsLogRow(entry: entry).id(entry.id)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 220)
+            .background(Color.black.opacity(0.35))
+            .cornerRadius(DesignSystem.CornerRadius.small)
+            .onChange(of: log.entries.count) { _ in
+                guard let last = log.entries.last else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    // MARK: - Export
+
+    private func copyToPasteboard() {
+        let snapshot = log.captureSnapshot(from: cameraManager)
+        let text = log.renderTxt(snapshot: snapshot)
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+    }
+
+    private func exportTxt() {
+        let snapshot = log.captureSnapshot(from: cameraManager)
+        let text = log.renderTxt(snapshot: snapshot)
+        saveToFile(data: Data(text.utf8), suggestedExt: "txt", contentType: .plainText)
+    }
+
+    private func exportJson() {
+        let snapshot = log.captureSnapshot(from: cameraManager)
+        let data = log.renderJson(snapshot: snapshot)
+        saveToFile(data: data, suggestedExt: "json", contentType: .json)
+    }
+
+    private func saveToFile(data: Data, suggestedExt: String, contentType: UTType) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [contentType]
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        panel.nameFieldStringValue = "gige-diagnostics-\(stamp).\(suggestedExt)"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try data.write(to: url)
+        } catch {
+            // Surface the failure visibly. The previous version only NSLog'd
+            // it; users assumed the file was saved and would email us with
+            // no attachment.
+            NSLog("Diagnostics export failed: \(error.localizedDescription)")
+            let alert = NSAlert()
+            alert.messageText = "Could not save diagnostics report"
+            alert.informativeText = "\(error.localizedDescription)\n\nTry saving to a different location (e.g. your Desktop) and then send us the file."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+}
+
+struct DiagnosticsLogRow: View {
+    let entry: DiagnosticsLog.Entry
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    private var levelColor: Color {
+        switch entry.level {
+        case "ERROR", "FAULT": return .red
+        case "NOTICE": return .yellow
+        case "INFO": return .white
+        case "DEBUG": return .gray
+        default: return .gray
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(Self.timeFormatter.string(from: entry.timestamp))
+                .foregroundColor(.gray)
+            Text(entry.level)
+                .foregroundColor(levelColor)
+                .frame(width: 56, alignment: .leading)
+            Text(entry.category)
+                .foregroundColor(.cyan)
+                .frame(width: 110, alignment: .leading)
+                .lineLimit(1)
+            Text(entry.message)
+                .foregroundColor(.white)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.system(size: 10.5, design: .monospaced))
+        .padding(.horizontal, DesignSystem.Spacing.xSmall)
     }
 }
 

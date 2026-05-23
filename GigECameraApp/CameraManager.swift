@@ -9,6 +9,7 @@ import Foundation
 import SwiftUI
 import Combine
 import os.log
+import OSLog
 import FramePipelineKit
 
 // UserDefaults extension for KVO
@@ -108,7 +109,21 @@ class CameraManager: NSObject, ObservableObject {
     }
     @Published var isShowingPreview = false
     @Published var isFrameSenderConnected = false  // Will be set true when sink connects
-    
+
+    /// True when the camera reports streaming but the sink hasn't received a
+    /// frame for `streamStallTimeoutSec` seconds. Surfaces a loud banner in the
+    /// UI so users see silent failures during an fMRI scan instead of
+    /// discovering them in post-hoc data review.
+    @Published var streamStalled = false
+
+    /// Seconds since the last successful frame send (0 while frames are flowing
+    /// or streaming is off). Bound to the UI banner text.
+    @Published var streamStallDurationSec: Double = 0
+
+    /// Cumulative count of times the PTS monotonicity guard had to nudge a
+    /// timestamp forward. Should stay at 0 in healthy operation.
+    @Published var ptsNudgeCount: UInt64 = 0
+
     // MARK: - Private Properties
     private let sinkConnector = CMIOSinkConnector()
     private var frameCount: Int = 0
@@ -116,6 +131,13 @@ class CameraManager: NSObject, ObservableObject {
     private let appGroupDefaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera")
     private let networkMonitor = NetworkInterfaceMonitor()
     private var lastDiscoveryTime = Date.distantPast
+
+    /// Stall watchdog. Ticks 2 Hz; flips `streamStalled` when no frame has been
+    /// sent in `streamStallTimeoutSec`. Triggers one-shot sink-reconnect recovery
+    /// on stall entry.
+    private var streamStallWatchdog: Timer?
+    private let streamStallTimeoutSec: Double = 2.0
+    private var hasAttemptedRecoveryThisStall = false
     
     // MARK: - Computed Properties
     var statusText: String {
@@ -747,7 +769,12 @@ class CameraManager: NSObject, ObservableObject {
         
         // Set up callbacks for automatic sink connection
         setupSinkConnectorCallbacks()
-        
+
+        // Start the stream-stall watchdog. Runs for the app's lifetime and
+        // self-gates on isStreaming so it only fires while the user expects
+        // frames to be flowing.
+        startStreamStallWatchdog()
+
         // Start the connection process
         logger.info("Starting sink connector connection...")
         let connected = sinkConnector.connect()
@@ -813,20 +840,89 @@ class CameraManager: NSObject, ObservableObject {
                 self.isFrameSenderConnected = connected
 
                 if connected {
-                    GigECameraManager.shared.startManifest()
                     self.logger.info("✅ Sink connector connected via property listener callback!")
 
-                    // Start Aravis streaming if camera is connected but not streaming
+                    // Start Aravis streaming if camera is connected but not streaming.
+                    // The manifest is started in startStreaming() (tied to camera
+                    // streaming, not sink connection) so an audit trail exists for
+                    // every frame the camera produces.
                     if self.isConnected && !GigECameraManager.shared.isStreaming {
                         self.logger.info("Starting Aravis streaming after sink connection")
                         GigECameraManager.shared.startStreaming()
                     }
                 } else {
-                    GigECameraManager.shared.stopManifest()
                     self.logger.warning("⚠️ Sink connector disconnected")
                 }
             }
         }
+    }
+
+    // MARK: - Stream Stall Watchdog
+
+    /// Starts the stall-detection timer. Runs every 0.5 s and:
+    /// 1. Reads the sink's last successful send timestamp.
+    /// 2. Sets `streamStalled = true` if no frame has been sent for
+    ///    `streamStallTimeoutSec` while `isStreaming` is true.
+    /// 3. On stall *entry*, attempts ONE recovery (disconnect/reconnect of the
+    ///    sink). If recovery fails, the banner stays up so the user knows the
+    ///    stream is dead.
+    /// 4. Always refreshes `ptsNudgeCount` from the connector for the UI.
+    private func startStreamStallWatchdog() {
+        streamStallWatchdog?.invalidate()
+        streamStallWatchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            // Timer fires on the main RunLoop but the closure type is not
+            // main-actor-annotated. Hop explicitly so the @Published writes
+            // remain on the main actor.
+            DispatchQueue.main.async {
+                self?.tickStreamStallWatchdog()
+            }
+        }
+    }
+
+    private func tickStreamStallWatchdog() {
+        let isStreaming = GigECameraManager.shared.isStreaming
+        let nowUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let lastSendNs = sinkConnector.lastSuccessfulSendUptimeNs
+        ptsNudgeCount = sinkConnector.nonMonotonicNudges
+
+        guard isStreaming else {
+            if streamStalled { streamStalled = false }
+            if streamStallDurationSec != 0 { streamStallDurationSec = 0 }
+            hasAttemptedRecoveryThisStall = false
+            return
+        }
+
+        // Edge case: no frames have ever been sent. Don't flag as a stall until
+        // the user has had a chance to actually start the stream.
+        guard lastSendNs != 0 else {
+            return
+        }
+
+        let elapsedNs = nowUptimeNs &- lastSendNs
+        let elapsedSec = Double(elapsedNs) / 1_000_000_000.0
+        let timedOut = elapsedSec > streamStallTimeoutSec
+
+        streamStallDurationSec = timedOut ? elapsedSec : 0
+
+        if timedOut, !streamStalled {
+            streamStalled = true
+            let elapsedRounded = String(format: "%.1f", elapsedSec)
+            logger.warning("⚠️ Stream stall detected -- no frame sent in \(elapsedRounded)s")
+            if !hasAttemptedRecoveryThisStall {
+                hasAttemptedRecoveryThisStall = true
+                attemptStreamStallRecovery()
+            }
+        } else if !timedOut, streamStalled {
+            streamStalled = false
+            hasAttemptedRecoveryThisStall = false
+            logger.info("Stream recovered -- frames flowing again")
+        }
+    }
+
+    private func attemptStreamStallRecovery() {
+        logger.warning("Attempting one-shot stream-stall recovery: sink disconnect/reconnect")
+        sinkConnector.disconnect()
+        _ = sinkConnector.connect()
     }
     
     func getPerformanceMetrics() -> (fps: Double, framesTotal: UInt64, framesDropped: UInt64) {
@@ -1038,5 +1134,245 @@ class CameraManager: NSObject, ObservableObject {
         }
         
         logger.info("Camera settings - Exposure: \(self.exposureTime)µs, Gain: \(self.gain), FPS: \(self.frameRate)")
+    }
+}
+
+// MARK: - Diagnostics Log
+
+/// In-app capture of recent unified-log entries from this process, plus a
+/// state snapshot pulled from `CameraManager`. Drives the Diagnostics drawer
+/// and the txt/json export buttons. Backed by `OSLogStore` so every existing
+/// `Logger()` call is captured automatically with no retrofit at call sites.
+///
+/// Lifecycle:
+/// - `loadInitialSnapshot()`: pull the last 5 minutes once. Cheap.
+/// - `startLive()` / `stopLive()`: toggle a 1 Hz background poll for new
+///   entries. Off by default so the app does no log work unless the user
+///   asks for it.
+/// - `entries` is the @Published source for the UI; capped at `maxEntries`.
+final class DiagnosticsLog: ObservableObject {
+    static let shared = DiagnosticsLog()
+
+    struct Entry: Identifiable, Codable {
+        let id: UUID
+        let timestamp: Date
+        let level: String
+        let category: String
+        let message: String
+
+        init(timestamp: Date, level: String, category: String, message: String) {
+            self.id = UUID()
+            self.timestamp = timestamp
+            self.level = level
+            self.category = category
+            self.message = message
+        }
+    }
+
+    struct Snapshot: Codable {
+        let timestamp: Date
+        let appVersion: String
+        let appBuild: String
+        let osVersion: String
+        let cameraModel: String
+        let isCameraConnected: Bool
+        let isStreaming: Bool
+        let sinkConnected: Bool
+        let streamStalled: Bool
+        let streamStallDurationSec: Double
+        let ptsNudgeCount: UInt64
+        let currentFormat: String
+        let frameRate: Double
+        let exposureTime: Double
+        let gain: Double
+        let selectedCameraId: String?
+    }
+
+    @Published private(set) var entries: [Entry] = []
+    @Published private(set) var isLive: Bool = false
+
+    private let maxEntries = 1000
+    private let subsystem = CameraConstants.BundleID.app
+    private var pollTimer: Timer?
+
+    // `cursorDate` is owned exclusively by `pollQueue`. Read and written only
+    // inside `pollQueue.async` blocks so concurrent fetches cannot read the
+    // same stale cursor and produce duplicate entries, and so `clear()` can
+    // serialize against any in-flight fetch.
+    private var cursorDate: Date = .distantPast
+    private let pollQueue = DispatchQueue(label: "com.lukechang.diagnosticsLog.poll", qos: .utility)
+    private let logger = Logger(subsystem: CameraConstants.BundleID.app, category: "Diagnostics")
+
+    private init() {}
+
+    /// Pull the last 5 minutes of log entries once. Safe to call repeatedly --
+    /// idempotent because the cursor advances past anything already fetched.
+    func loadInitialSnapshot() {
+        pollQueue.async { [weak self] in
+            guard let self = self else { return }
+            if self.cursorDate == .distantPast {
+                self.cursorDate = Date().addingTimeInterval(-300)
+            }
+            self.fetchOnPollQueue()
+        }
+    }
+
+    func startLive() {
+        guard !isLive else { return }
+        isLive = true
+        pollQueue.async { [weak self] in
+            guard let self = self else { return }
+            if self.cursorDate == .distantPast {
+                self.cursorDate = Date().addingTimeInterval(-60)
+            }
+        }
+        // Timer fires on the main RunLoop; the actual log read hops to
+        // `pollQueue` so a slow OSLogStore query never blocks the UI.
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollQueue.async { [weak self] in
+                self?.fetchOnPollQueue()
+            }
+        }
+    }
+
+    func stopLive() {
+        guard isLive else { return }
+        isLive = false
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    func clear() {
+        // Wipe UI immediately so the user sees the clear take effect, then
+        // serialize the cursor reset through `pollQueue` so any in-flight
+        // fetch's main-async append runs *before* a subsequent fetch sees the
+        // new cursor. Any older main-async append that fires after this is
+        // followed by the matching main-async wipe below, so the final state
+        // is empty.
+        entries.removeAll()
+        pollQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.cursorDate = Date()
+            DispatchQueue.main.async { [weak self] in
+                self?.entries.removeAll()
+            }
+        }
+    }
+
+    /// Run on `pollQueue`. Reads/writes `cursorDate` directly; appends results
+    /// on the main thread.
+    private func fetchOnPollQueue() {
+        dispatchPrecondition(condition: .onQueue(pollQueue))
+        let cursor = cursorDate
+        guard let store = try? OSLogStore(scope: .currentProcessIdentifier) else { return }
+        let position = store.position(date: cursor)
+
+        // Filter at the store level for our subsystem -- much cheaper than
+        // pulling every system log entry and filtering in Swift.
+        let predicate = NSPredicate(format: "subsystem == %@", subsystem)
+        guard let stored = try? store.getEntries(at: position, matching: predicate) else { return }
+
+        var fetched: [Entry] = []
+        for entry in stored {
+            guard let logEntry = entry as? OSLogEntryLog else { continue }
+            guard logEntry.date > cursor else { continue }
+            fetched.append(Entry(
+                timestamp: logEntry.date,
+                level: Self.levelString(logEntry.level),
+                category: logEntry.category,
+                message: logEntry.composedMessage
+            ))
+        }
+
+        guard let last = fetched.last else { return }
+        cursorDate = last.timestamp
+        let snapshot = fetched
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.entries.append(contentsOf: snapshot)
+            if self.entries.count > self.maxEntries {
+                self.entries.removeFirst(self.entries.count - self.maxEntries)
+            }
+        }
+    }
+
+    private static func levelString(_ level: OSLogEntryLog.Level) -> String {
+        switch level {
+        case .debug: return "DEBUG"
+        case .info: return "INFO"
+        case .notice: return "NOTICE"
+        case .error: return "ERROR"
+        case .fault: return "FAULT"
+        case .undefined: return "?"
+        @unknown default: return "?"
+        }
+    }
+
+    // MARK: - Snapshot
+
+    @MainActor
+    func captureSnapshot(from cameraManager: CameraManager) -> Snapshot {
+        Snapshot(
+            timestamp: Date(),
+            appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?",
+            appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?",
+            osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+            cameraModel: cameraManager.cameraModel,
+            isCameraConnected: cameraManager.isConnected,
+            isStreaming: GigECameraManager.shared.isStreaming,
+            sinkConnected: cameraManager.isFrameSenderConnected,
+            streamStalled: cameraManager.streamStalled,
+            streamStallDurationSec: cameraManager.streamStallDurationSec,
+            ptsNudgeCount: cameraManager.ptsNudgeCount,
+            currentFormat: cameraManager.currentFormat,
+            frameRate: cameraManager.frameRate,
+            exposureTime: cameraManager.exposureTime,
+            gain: cameraManager.gain,
+            selectedCameraId: cameraManager.selectedCameraId
+        )
+    }
+
+    // MARK: - Export
+
+    func renderTxt(snapshot: Snapshot) -> String {
+        let isoMs = ISO8601DateFormatter()
+        isoMs.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        var out = "GigE Virtual Camera Diagnostics\n"
+        out += "================================\n"
+        out += "Reported:     \(isoMs.string(from: snapshot.timestamp))\n"
+        out += "App version:  \(snapshot.appVersion) (build \(snapshot.appBuild))\n"
+        out += "macOS:        \(snapshot.osVersion)\n"
+        out += "Camera:       \(snapshot.cameraModel)\n"
+        out += "\nState:\n"
+        out += "  Camera connected:    \(snapshot.isCameraConnected)\n"
+        out += "  Camera streaming:    \(snapshot.isStreaming)\n"
+        out += "  Sink connected:      \(snapshot.sinkConnected)\n"
+        out += "  Stream stalled:      \(snapshot.streamStalled)\n"
+        out += "  Stall duration (s):  \(String(format: "%.2f", snapshot.streamStallDurationSec))\n"
+        out += "  PTS nudges (cum.):   \(snapshot.ptsNudgeCount)\n"
+        out += "  Current format:      \(snapshot.currentFormat)\n"
+        out += "  Frame rate (fps):    \(String(format: "%.2f", snapshot.frameRate))\n"
+        out += "  Exposure (µs):       \(String(format: "%.0f", snapshot.exposureTime))\n"
+        out += "  Gain:                \(String(format: "%.2f", snapshot.gain))\n"
+        out += "  Selected camera ID:  \(snapshot.selectedCameraId ?? "(none)")\n"
+        out += "\nLog entries (\(entries.count) of max \(maxEntries)):\n"
+        out += "================================\n"
+        for entry in entries {
+            out += "\(isoMs.string(from: entry.timestamp)) [\(entry.level)] [\(entry.category)] \(entry.message)\n"
+        }
+        return out
+    }
+
+    func renderJson(snapshot: Snapshot) -> Data {
+        struct Payload: Encodable {
+            let snapshot: Snapshot
+            let entries: [Entry]
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return (try? encoder.encode(Payload(snapshot: snapshot, entries: entries))) ?? Data()
     }
 }

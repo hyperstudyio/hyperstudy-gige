@@ -10,6 +10,7 @@ import CoreMediaIO
 import CoreVideo
 import AVFoundation
 import os.log
+import os.lock
 import FramePipelineKit
 
 // MARK: - Stream State Monitor
@@ -82,13 +83,42 @@ class CMIOSinkConnector {
     // State
     private var isConnected = false
     private var frameCount: UInt64 = 0
-    
+
+    // Mach-uptime ns of last successful CMSimpleQueueEnqueue. Read by the
+    // stream-stall watchdog in CameraManager. Protected by `livenessLock`.
+    private var _lastSuccessfulSendUptimeNs: UInt64 = 0
+
+    // Last PTS (uptime ns) actually delivered to the sink queue, used for the
+    // monotonicity guard. Protected by `livenessLock`.
+    private var _lastPtsNs: UInt64 = 0
+
+    // Monotonic-nudge counter for the manifest / debug logs.
+    private var _nonMonotonicNudges: UInt64 = 0
+
+    private var livenessLock = os_unfair_lock()
+
+    /// Thread-safe accessor for the watchdog. Returns 0 if no frame has ever
+    /// been sent through this connector.
+    var lastSuccessfulSendUptimeNs: UInt64 {
+        os_unfair_lock_lock(&livenessLock)
+        defer { os_unfair_lock_unlock(&livenessLock) }
+        return _lastSuccessfulSendUptimeNs
+    }
+
+    /// Total number of times the PTS monotonicity guard had to nudge a
+    /// timestamp forward. Should stay at 0 in healthy operation.
+    var nonMonotonicNudges: UInt64 {
+        os_unfair_lock_lock(&livenessLock)
+        defer { os_unfair_lock_unlock(&livenessLock) }
+        return _nonMonotonicNudges
+    }
+
     // Stream state monitoring
     private let streamStateMonitor = StreamStateMonitor()
-    
+
     // Property listener for automatic sink detection
     private var propertyListener: CMIOPropertyListener?
-    
+
     // Callbacks
     var onSinkStreamAvailable: ((Bool) -> Void)?
     var onConnectionStateChanged: ((Bool) -> Void)?
@@ -233,7 +263,16 @@ class CMIOSinkConnector {
             return false
         }
         
-        // Success!
+        // Success! Reset liveness/monotonicity state so a new session starts
+        // from a clean slate -- otherwise the next session would see a stale
+        // _lastPtsNs and nudge every frame, and a stale _lastSuccessfulSendUptimeNs
+        // from a previous session could spuriously clear/trigger the watchdog.
+        os_unfair_lock_lock(&livenessLock)
+        _lastPtsNs = 0
+        _lastSuccessfulSendUptimeNs = 0
+        _nonMonotonicNudges = 0
+        os_unfair_lock_unlock(&livenessLock)
+
         isConnected = true
         connectionRetryCount = 0  // Reset retry count on success
         logger.info("✅ Successfully connected to virtual camera sink stream via property listener!")
@@ -324,6 +363,12 @@ class CMIOSinkConnector {
         if result == noErr {
             frameCount += 1
 
+            // Update liveness so the watchdog knows frames are flowing.
+            let nowUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            os_unfair_lock_lock(&livenessLock)
+            _lastSuccessfulSendUptimeNs = nowUptimeNs
+            os_unfair_lock_unlock(&livenessLock)
+
             // Log periodically
             if frameCount % 30 == 0 {
                 let width = CVPixelBufferGetWidth(yuvBuffer)
@@ -396,9 +441,24 @@ class CMIOSinkConnector {
         // Use the capture-time host timestamp (CLOCK_UPTIME_RAW ns, same mach
         // timebase as the host time clock) so the presentation timeline reflects
         // when the frame was captured — not when it happened to be processed.
+        //
+        // Monotonicity guard: CMIO consumers freeze on non-monotonic PTS. If a
+        // future regression (Aravis frame-ID reset, clock adjustment, duplicate)
+        // produces a PTS <= the last one we sent, nudge it forward by 1ns rather
+        // than dropping the frame. Track how often we have to do this so it can
+        // surface in the manifest and debug logs.
+        var ptsNs = timestamp.hostTimestampNs
+        os_unfair_lock_lock(&livenessLock)
+        if ptsNs <= _lastPtsNs {
+            ptsNs = _lastPtsNs &+ 1
+            _nonMonotonicNudges &+= 1
+        }
+        _lastPtsNs = ptsNs
+        os_unfair_lock_unlock(&livenessLock)
+
         var timingInfo = CMSampleTimingInfo(
             duration: CMTime.invalid,
-            presentationTimeStamp: CMTimeMake(value: Int64(bitPattern: timestamp.hostTimestampNs),
+            presentationTimeStamp: CMTimeMake(value: Int64(bitPattern: ptsNs),
                                               timescale: 1_000_000_000),
             decodeTimeStamp: CMTime.invalid
         )

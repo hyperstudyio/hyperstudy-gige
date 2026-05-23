@@ -221,16 +221,24 @@ import FramePipelineKit
             print("GigECameraManager: Cannot start streaming - not connected")
             return
         }
-        
+
         guard aravisBridge.startStreaming() else {
             print("GigECameraManager: aravisBridge.startStreaming() failed")
             return
         }
+
+        // Manifest lifecycle is tied to actual frame production, NOT to sink
+        // connector state, so we always have an audit trail covering every
+        // frame the camera emitted -- even frames that were dropped before
+        // reaching a downstream consumer.
+        startManifest()
+
         print("GigECameraManager: Streaming started successfully")
     }
-    
+
     func stopStreaming() {
         aravisBridge.stopStreaming()
+        stopManifest()
     }
     
     // MARK: - Frame Handling

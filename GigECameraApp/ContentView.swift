@@ -10,6 +10,7 @@ import IOSurface
 import CoreImage
 import AppKit
 import UniformTypeIdentifiers
+import FramePipelineKit
 
 struct ContentView: View {
     @EnvironmentObject var cameraManager: CameraManager
@@ -760,6 +761,26 @@ class PreviewFrameHandler: ObservableObject {
     private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
     private let maxPreviewWidth: CGFloat = 1280
 
+    // Drop-to-latest slot for the main-thread image hop. Without this, the
+    // preview callback was scheduling a `DispatchQueue.main.async` per frame
+    // and capturing the rendered NSImage by value; when SwiftUI fell even
+    // slightly behind 30 fps, the pending closures piled up unbounded — each
+    // retaining a multi-MB NSImage — and the process grew at hundreds of
+    // MB/sec until the machine OOMed. The slot bounds image retention to 1.
+    //
+    // The slot pairs the image with its render-time uptime so the main thread
+    // assignment uses the latest frame's timestamp (not the stale one captured
+    // when scheduling was first triggered).
+    private struct PendingPreview {
+        let image: NSImage
+        let renderUptimeNs: UInt64
+    }
+    private let mainImageSlot = LatestFrameSlot<PendingPreview>()
+    // Coalesces main-thread scheduling: at most one main-async is in flight
+    // at a time, so the dispatch queue itself cannot accumulate either.
+    private let mainScheduleLock = NSLock()
+    private var mainUpdatePending = false
+
     init() {
         // Wire onPreviewFrame at construction time, BEFORE any frame can arrive.
         // The previous design only assigned the callback after an asyncAfter
@@ -819,10 +840,40 @@ class PreviewFrameHandler: ObservableObject {
                                   size: NSSize(width: cgImage.width, height: cgImage.height))
 
             let nowUptime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            DispatchQueue.main.async {
-                self.currentImage = nsImage
-                self.lastPreviewUptimeNs = nowUptime
-                if self.previewStalled { self.previewStalled = false }
+
+            // Drop-to-latest hop to main. Setting the slot displaces (and
+            // releases) any prior NSImage that the main thread hasn't picked
+            // up yet, so memory never grows beyond a single pending image
+            // regardless of how backlogged main is. We schedule at most one
+            // main-async update at a time so the dispatch queue itself can't
+            // accumulate either.
+            //
+            // Both the producer (set + needs-schedule decision) and the
+            // consumer (take + pending clear) run under `mainScheduleLock`
+            // so they are atomic with respect to each other. Without this
+            // serialisation a producer could observe pending=true while the
+            // consumer was mid-render (between take and pending-clear), skip
+            // scheduling, and the consumer would then clear pending without
+            // ever rendering the producer's frame — leaving the frame
+            // stranded in the slot until the next producer arrived.
+            self.mainScheduleLock.lock()
+            self.mainImageSlot.set(PendingPreview(image: nsImage, renderUptimeNs: nowUptime))
+            let needsSchedule = !self.mainUpdatePending
+            if needsSchedule { self.mainUpdatePending = true }
+            self.mainScheduleLock.unlock()
+
+            if needsSchedule {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.mainScheduleLock.lock()
+                    let latest = self.mainImageSlot.take()
+                    self.mainUpdatePending = false
+                    self.mainScheduleLock.unlock()
+                    guard let latest = latest else { return }
+                    self.currentImage = latest.image
+                    self.lastPreviewUptimeNs = latest.renderUptimeNs
+                    if self.previewStalled { self.previewStalled = false }
+                }
             }
         }
 

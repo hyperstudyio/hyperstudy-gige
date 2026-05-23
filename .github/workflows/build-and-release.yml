@@ -354,46 +354,15 @@ jobs:
 
           echo "DMG notarization completed successfully"
 
-      - name: Generate release notes
-        id: release_notes
-        run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
-
-          cat > $RUNNER_TEMP/release_notes.md << EOF
-          # GigE Virtual Camera ${VERSION}
-
-          macOS application for creating virtual cameras from GigE Vision cameras.
-
-          ## Installation
-
-          1. Download the DMG file below
-          2. Open the DMG and drag GigEVirtualCamera.app to Applications
-          3. Launch the application
-          4. Grant system extension permission in System Settings → Privacy & Security
-          5. Connect to your GigE camera
-
-          ## Requirements
-
-          - macOS 12.3 or later
-          - Apple Silicon Mac (arm64)
-          - GigE Vision camera (or use built-in test camera)
-
-          ## What's New
-
-          See CHANGELOG.md for detailed changes.
-
-          ## Support
-
-          For issues and feature requests, please visit the GitHub Issues page.
-          EOF
-
-          echo "Release notes generated"
-
       - name: Create GitHub Release
+        # The body is generated entirely by GitHub's auto-generated release-
+        # notes (PR list + full changelog link). Static installation/requirements
+        # boilerplate intentionally NOT included here -- it lives in the docs
+        # page (docs.hyperstudy.io) and was duplicating across every release,
+        # cluttering both github.com/.../releases and the synced docs page.
         uses: softprops/action-gh-release@v1
         with:
           files: build/distribution/GigEVirtualCamera-${{ steps.version.outputs.VERSION }}.dmg
-          body_path: ${{ runner.temp }}/release_notes.md
           draft: false
           prerelease: false
           generate_release_notes: true

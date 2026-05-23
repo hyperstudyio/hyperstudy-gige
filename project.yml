@@ -14,19 +14,20 @@ settings:
   # Build for Apple Silicon only (Aravis is arm64 only)
   ARCHS: arm64
   ONLY_ACTIVE_ARCH: NO
-  # Aravis settings
-  HEADER_SEARCH_PATHS: 
+  # Aravis settings. Use version-agnostic /opt/homebrew/opt/* symlinks so
+  # `brew upgrade` doesn't silently break the build by moving Cellar versions.
+  HEADER_SEARCH_PATHS:
     - /opt/homebrew/include
-    - /opt/homebrew/Cellar/aravis/0.8.35/include/aravis-0.8
-    - /opt/homebrew/Cellar/glib/2.84.3/include
-    - /opt/homebrew/Cellar/glib/2.84.3/include/glib-2.0
-    - /opt/homebrew/Cellar/glib/2.84.3/lib/glib-2.0/include
+    - /opt/homebrew/opt/aravis/include/aravis-0.8
+    - /opt/homebrew/opt/glib/include
+    - /opt/homebrew/opt/glib/include/glib-2.0
+    - /opt/homebrew/opt/glib/lib/glib-2.0/include
     - /opt/homebrew/opt/gettext/include
-    - /opt/homebrew/Cellar/pcre2/10.45/include
+    - /opt/homebrew/opt/pcre2/include
     - /Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk/usr/include/ffi
   LIBRARY_SEARCH_PATHS:
     - /opt/homebrew/lib
-    - /opt/homebrew/Cellar/aravis/0.8.35/lib
+    - /opt/homebrew/opt/aravis/lib
   OTHER_LDFLAGS:
     - -laravis-0.8
     - -lgio-2.0

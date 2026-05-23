@@ -11,26 +11,27 @@ import SwiftUI
 struct GigECameraApp: App {
     @StateObject private var cameraManager = CameraManager.shared
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    
+
+    // Fixed window footprint. The two-column layout in ContentView is sized
+    // around this; resizing leaves dead space or clips. Long content (the
+    // diagnostics log) scrolls inside the Diagnostics drawer.
+    private static let windowWidth: CGFloat = 960
+    private static let windowHeight: CGFloat = 680
+
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(cameraManager)
-                .frame(minWidth: 400, idealWidth: 400, maxWidth: 400)
+                .frame(width: Self.windowWidth, height: Self.windowHeight)
                 .onAppear {
-                    // Configure window
                     DispatchQueue.main.async {
-                        if let window = NSApplication.shared.windows.first {
-                            // Set minimum size but allow vertical expansion
-                            window.minSize = NSSize(width: 400, height: 680)
-                            window.maxSize = NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude)
-                            
-                            // Make window resizable
-                            window.styleMask.insert(.resizable)
-                            
-                            // Center the window
-                            window.center()
-                        }
+                        guard let window = NSApplication.shared.windows.first else { return }
+                        let size = NSSize(width: Self.windowWidth, height: Self.windowHeight)
+                        window.setContentSize(size)
+                        window.contentMinSize = size
+                        window.contentMaxSize = size
+                        window.styleMask.remove(.resizable)
+                        window.center()
                     }
                 }
         }

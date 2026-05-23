@@ -357,8 +357,13 @@ class CMIOSinkConnector {
             return false
         }
 
-        // Enqueue the buffer
-        let result = CMSimpleQueueEnqueue(queue, element: Unmanaged.passRetained(sampleBuffer).toOpaque())
+        // Enqueue the buffer. `passRetained` produces a +1 reference that is
+        // transferred to CMIO IF the enqueue succeeds; on failure we own the
+        // reference and MUST release it or the sample buffer leaks. At a 6-
+        // frame queue and 30 fps streaming, queue-full is not rare during
+        // brief consumer stalls and the leak is observable in long sessions.
+        let unmanaged = Unmanaged.passRetained(sampleBuffer)
+        let result = CMSimpleQueueEnqueue(queue, element: unmanaged.toOpaque())
 
         if result == noErr {
             frameCount += 1
@@ -378,6 +383,8 @@ class CMIOSinkConnector {
                 logger.info("📤 Sent frame #\(self.frameCount) to sink | \(width)x\(height) | Format: \(formatString)")
             }
         } else {
+            // Balance the retain so the sample buffer doesn't leak.
+            unmanaged.release()
             switch result {
             case kCMSimpleQueueError_QueueIsFull:
                 logger.warning("Queue is full - dropping frame")

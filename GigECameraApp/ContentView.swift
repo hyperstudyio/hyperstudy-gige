@@ -13,9 +13,18 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject var cameraManager: CameraManager
-    @State private var previewImage: NSImage?
     @StateObject private var extensionManager = ExtensionManager.shared
     @State private var isDiscoveringCameras = false
+    /// Brief "✓ Refreshed" indicator next to the camera refresh button.
+    /// Cleared via a cancellable work item so rapid clicks don't queue
+    /// overlapping `asyncAfter` blocks that fight to set/clear the label.
+    @State private var refreshFeedback: String?
+    @State private var refreshFeedbackClearWork: DispatchWorkItem?
+    @State private var refreshFinishWork: DispatchWorkItem?
+    /// Collapsed state for the Camera Controls sliders. Expanded by default
+    /// so power users see them; researchers running a long scan can collapse
+    /// to keep the right column tidy.
+    @State private var slidersExpanded = true
     
     var selectedCameraText: String {
         if let selectedId = cameraManager.selectedCameraId,
@@ -59,38 +68,30 @@ struct ContentView: View {
         case "Connecting":
             return DesignSystem.Colors.statusOrange
         case "Connected":
-            return DesignSystem.Colors.statusGreen
+            return DesignSystem.Colors.statusSuccess
         case "Failed":
-            return .red
+            return DesignSystem.Colors.statusError
         default:
             return DesignSystem.Colors.textSecondary
         }
     }
     
     var body: some View {
+        // The OS window title bar already reads "GigEVirtualCamera"; the
+        // previous in-app HeaderView ("GigE Virtual Camera" + animated camera
+        // icon) duplicated that and ate ~100 px of fixed-height vertical
+        // space without adding information.
         ZStack {
             VisualEffectBackground()
 
-            VStack(spacing: 0) {
-                HeaderView(isConnected: cameraManager.isConnected)
-                    .padding(.vertical, DesignSystem.Spacing.medium)
-                    .padding(.horizontal, DesignSystem.Spacing.large)
+            HStack(spacing: 0) {
+                previewColumn
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 Divider()
 
-                // Two-column body: preview on the left, controls + diagnostics
-                // on the right. The right column has a fixed width and scrolls
-                // internally so a long list of controls or an expanded
-                // diagnostics drawer never pushes the window taller.
-                HStack(spacing: 0) {
-                    previewColumn
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                    Divider()
-
-                    controlsColumn
-                        .frame(width: 360)
-                }
+                controlsColumn
+                    .frame(width: 360)
             }
         }
         .frame(minWidth: 820, idealWidth: 960, minHeight: 560, idealHeight: 680)
@@ -103,7 +104,7 @@ struct ContentView: View {
 
     private var previewColumn: some View {
         VStack(spacing: DesignSystem.Spacing.small) {
-            CameraPreviewSection(previewImage: $previewImage)
+            CameraPreviewSection()
                 .environmentObject(cameraManager)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -143,7 +144,9 @@ struct ContentView: View {
 
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.triangle.2.circlepath")
-                        .foregroundColor(cameraManager.isFrameSenderConnected ? .green : .orange)
+                        .foregroundColor(cameraManager.isFrameSenderConnected
+                                         ? DesignSystem.Colors.statusSuccess
+                                         : DesignSystem.Colors.statusOrange)
                         .font(.system(size: 11))
                     Text(cameraManager.isFrameSenderConnected ? "Sink connected" : "Sink waiting…")
                         .font(DesignSystem.Typography.caption)
@@ -189,75 +192,99 @@ struct ContentView: View {
         }
     }
 
+    /// Compact extension card. In normal operation users see only a status
+    /// dot + label; the Install / Uninstall actions live behind a Menu so
+    /// they don't dominate the panel, and any debug output is hidden by
+    /// default behind a disclosure (mirroring the Diagnostics drawer rather
+    /// than dumping monospaced text into the main UI).
     private var extensionStatusSection: some View {
-        VStack(spacing: DesignSystem.Spacing.small) {
-            HStack {
-                Label("Camera Extension", systemImage: "puzzlepiece.extension")
+        let status = extensionManager.extensionStatus
+        let isInstalled = status == "Installed"
+        let needsApproval = status == "Needs Approval"
+        let hasDebug = !extensionManager.statusMessage.isEmpty || !extensionManager.errorDetail.isEmpty
+        let statusColor: Color = isInstalled
+            ? DesignSystem.Colors.statusSuccess
+            : (needsApproval ? DesignSystem.Colors.statusOrange : DesignSystem.Colors.textSecondary)
+
+        return VStack(alignment: .leading, spacing: DesignSystem.Spacing.xSmall) {
+            HStack(spacing: DesignSystem.Spacing.xSmall) {
+                Image(systemName: "puzzlepiece.extension")
+                    .foregroundColor(DesignSystem.Colors.textSecondary)
+                Text("Camera Extension")
                     .font(DesignSystem.Typography.callout)
                     .foregroundColor(DesignSystem.Colors.textSecondary)
                 Spacer()
-                Text(extensionManager.extensionStatus)
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+                Text(status)
                     .font(DesignSystem.Typography.caption)
                     .fontWeight(.medium)
-                    .foregroundColor(extensionManager.extensionStatus == "Installed" ? .green : DesignSystem.Colors.textSecondary)
+                    .foregroundColor(statusColor)
+                Menu {
+                    Button {
+                        extensionManager.installExtension()
+                    } label: {
+                        Label("Install Extension", systemImage: "plus.circle")
+                    }
+                    .disabled(extensionManager.isInstalling || isInstalled)
+
+                    Button {
+                        extensionManager.uninstallExtension()
+                    } label: {
+                        Label("Uninstall Extension", systemImage: "minus.circle")
+                    }
+                    .disabled(extensionManager.isInstalling || !isInstalled)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Manage extension")
             }
 
-            HStack(spacing: DesignSystem.Spacing.small) {
-                Button {
-                    extensionManager.installExtension()
-                } label: {
-                    Label("Install", systemImage: "plus.circle")
-                        .font(DesignSystem.Typography.caption)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(extensionManager.isInstalling || extensionManager.extensionStatus == "Installed")
-
-                Button {
-                    extensionManager.uninstallExtension()
-                } label: {
-                    Label("Uninstall", systemImage: "minus.circle")
-                        .font(DesignSystem.Typography.caption)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(extensionManager.isInstalling || extensionManager.extensionStatus != "Installed")
-
-                Spacer()
-            }
-
-            if extensionManager.extensionStatus == "Needs Approval" {
-                HStack(spacing: 4) {
+            if needsApproval {
+                HStack(spacing: DesignSystem.Spacing.xSmall) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
+                        .foregroundColor(DesignSystem.Colors.statusOrange)
                     Text("Approve in System Settings → Privacy & Security")
                         .font(DesignSystem.Typography.caption)
-                        .foregroundColor(.orange)
+                        .foregroundColor(DesignSystem.Colors.statusOrange)
                 }
             }
 
-            if !extensionManager.statusMessage.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(extensionManager.statusMessage)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.blue)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if !extensionManager.errorDetail.isEmpty {
-                        Text(extensionManager.errorDetail)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.red)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            if hasDebug {
+                DisclosureGroup {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if !extensionManager.statusMessage.isEmpty {
+                            Text(extensionManager.statusMessage)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(DesignSystem.Colors.statusInfo)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if !extensionManager.errorDetail.isEmpty {
+                            Text(extensionManager.errorDetail)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(DesignSystem.Colors.statusError)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
+                    .padding(DesignSystem.Spacing.xSmall)
+                    .background(DesignSystem.Colors.logSurface)
+                    .cornerRadius(DesignSystem.CornerRadius.small)
+                } label: {
+                    Text("Details")
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
                 }
-                .padding(DesignSystem.Spacing.xSmall)
-                .background(Color.black.opacity(0.18))
-                .cornerRadius(DesignSystem.CornerRadius.small)
             }
         }
         .padding(DesignSystem.Spacing.small)
         .background(
             RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
-                .fill(Color.gray.opacity(0.1))
+                .fill(DesignSystem.Colors.backgroundSecondary.opacity(0.6))
         )
     }
 
@@ -268,12 +295,29 @@ struct ContentView: View {
                     .font(DesignSystem.Typography.callout)
                     .foregroundColor(DesignSystem.Colors.textSecondary)
                 Spacer()
-                Button {
-                    isDiscoveringCameras = true
-                    cameraManager.refreshCameraList()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                        isDiscoveringCameras = false
+                // "Refreshing…" appears immediately on click and is replaced
+                // by "✓ Refreshed" when discovery completes -- single
+                // continuous phase instead of the previous "click, wait 2.5
+                // s with no feedback, then briefly flash a checkmark".
+                if isDiscoveringCameras {
+                    HStack(spacing: 4) {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle())
+                            .scaleEffect(0.55)
+                            .frame(width: 11, height: 11)
+                        Text("Refreshing…")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.textSecondary)
                     }
+                    .transition(.opacity)
+                } else if let feedback = refreshFeedback {
+                    Text(feedback)
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.statusSuccess)
+                        .transition(.opacity)
+                }
+                Button {
+                    triggerCameraRefresh()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 11))
@@ -315,21 +359,51 @@ struct ContentView: View {
                     }
                     Image(systemName: "chevron.down")
                         .font(.caption)
-                        .foregroundColor(.gray)
+                        .foregroundColor(DesignSystem.Colors.textSecondary)
                 }
                 .padding(.horizontal, DesignSystem.Spacing.small)
-                .padding(.vertical, 6)
+                .padding(.vertical, DesignSystem.Spacing.xSmall)
                 .background(
                     RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.small)
-                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                        .stroke(DesignSystem.Colors.border, lineWidth: 1)
                         .background(
                             RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.small)
-                                .fill(Color.gray.opacity(0.05))
+                                .fill(DesignSystem.Colors.backgroundSecondary.opacity(0.4))
                         )
                 )
             }
             .menuStyle(.borderlessButton)
         }
+    }
+
+    /// Kicks the camera-discovery flow and drives a single piece of UI
+    /// feedback: a "Refreshing…" spinner appears immediately, then is
+    /// replaced by "✓ Refreshed" when discovery completes, then fades.
+    /// All transitions are driven by cancellable `DispatchWorkItem`s so
+    /// rapid clicks can't race overlapping `asyncAfter` blocks.
+    private func triggerCameraRefresh() {
+        refreshFinishWork?.cancel()
+        refreshFeedbackClearWork?.cancel()
+
+        withAnimation {
+            isDiscoveringCameras = true
+            refreshFeedback = nil
+        }
+        cameraManager.refreshCameraList()
+
+        let finish = DispatchWorkItem {
+            withAnimation {
+                isDiscoveringCameras = false
+                refreshFeedback = "✓ Refreshed"
+            }
+            let clear = DispatchWorkItem {
+                withAnimation { refreshFeedback = nil }
+            }
+            refreshFeedbackClearWork = clear
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: clear)
+        }
+        refreshFinishWork = finish
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: finish)
     }
 
     private var formatSection: some View {
@@ -346,7 +420,7 @@ struct ContentView: View {
                 }
                 .pickerStyle(.menu)
                 .labelsHidden()
-                .frame(maxWidth: 170)
+                .frame(maxWidth: 210)
             }
             HStack {
                 Label("Pixel Format", systemImage: "square.grid.3x3.fill")
@@ -360,51 +434,64 @@ struct ContentView: View {
                 }
                 .pickerStyle(.menu)
                 .labelsHidden()
-                .frame(maxWidth: 140)
+                .frame(maxWidth: 180)
             }
         }
     }
 
+    @ViewBuilder
     private var slidersSection: some View {
-        VStack(spacing: DesignSystem.Spacing.small) {
-            if cameraManager.exposureTimeAvailable {
-                sliderRow(
-                    label: "Exposure",
-                    icon: "timer",
-                    value: "\(Int(cameraManager.exposureTime)) µs",
-                    binding: $cameraManager.exposureTime,
-                    range: cameraManager.exposureTimeMin...cameraManager.exposureTimeMax,
-                    step: 1
-                )
-            }
-            if cameraManager.gainAvailable {
-                sliderRow(
-                    label: "Gain",
-                    icon: "dial.high",
-                    value: String(format: "%.1fx", cameraManager.gain),
-                    binding: $cameraManager.gain,
-                    range: cameraManager.gainMin...cameraManager.gainMax,
-                    step: 0.1
-                )
-            }
-            if cameraManager.frameRateAvailable && cameraManager.selectedFormatIndex != 0 {
-                sliderRow(
-                    label: "Frame Rate",
-                    icon: "speedometer",
-                    value: "\(Int(cameraManager.frameRate)) fps",
-                    binding: $cameraManager.frameRate,
-                    range: cameraManager.frameRateMin...cameraManager.frameRateMax,
-                    step: 1
-                )
-            }
-            if !cameraManager.exposureTimeAvailable && !cameraManager.gainAvailable && !cameraManager.frameRateAvailable {
-                HStack {
-                    Image(systemName: "info.circle")
-                        .foregroundColor(.orange)
-                    Text("Camera controls not available")
-                        .font(DesignSystem.Typography.caption)
-                        .foregroundColor(.orange)
+        let anyAvailable = cameraManager.exposureTimeAvailable
+            || cameraManager.gainAvailable
+            || (cameraManager.frameRateAvailable && cameraManager.selectedFormatIndex != 0)
+
+        if anyAvailable {
+            DisclosureGroup(isExpanded: $slidersExpanded) {
+                VStack(spacing: DesignSystem.Spacing.small) {
+                    if cameraManager.exposureTimeAvailable {
+                        sliderRow(
+                            label: "Exposure",
+                            icon: "timer",
+                            value: "\(Int(cameraManager.exposureTime)) µs",
+                            binding: $cameraManager.exposureTime,
+                            range: cameraManager.exposureTimeMin...cameraManager.exposureTimeMax,
+                            step: 1
+                        )
+                    }
+                    if cameraManager.gainAvailable {
+                        sliderRow(
+                            label: "Gain",
+                            icon: "dial.high",
+                            value: String(format: "%.1fx", cameraManager.gain),
+                            binding: $cameraManager.gain,
+                            range: cameraManager.gainMin...cameraManager.gainMax,
+                            step: 0.1
+                        )
+                    }
+                    if cameraManager.frameRateAvailable && cameraManager.selectedFormatIndex != 0 {
+                        sliderRow(
+                            label: "Frame Rate",
+                            icon: "speedometer",
+                            value: "\(Int(cameraManager.frameRate)) fps",
+                            binding: $cameraManager.frameRate,
+                            range: cameraManager.frameRateMin...cameraManager.frameRateMax,
+                            step: 1
+                        )
+                    }
                 }
+                .padding(.top, DesignSystem.Spacing.xSmall)
+            } label: {
+                Label("Camera Controls", systemImage: "slider.horizontal.3")
+                    .font(DesignSystem.Typography.callout)
+                    .foregroundColor(DesignSystem.Colors.textSecondary)
+            }
+        } else {
+            HStack {
+                Image(systemName: "info.circle")
+                    .foregroundColor(DesignSystem.Colors.statusOrange)
+                Text("Camera controls not available")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(DesignSystem.Colors.statusOrange)
             }
         }
     }
@@ -428,35 +515,6 @@ struct ContentView: View {
         }
     }
 
-}
-
-// MARK: - Header View
-
-struct HeaderView: View {
-    let isConnected: Bool
-    @State private var iconRotation: Double = 0
-    
-    var body: some View {
-        VStack(spacing: DesignSystem.Spacing.small) {
-            // Animated camera icon
-            Image(systemName: isConnected ? "camera.fill" : "camera")
-                .font(.system(size: 48))
-                .foregroundColor(isConnected ? DesignSystem.Colors.statusGreen : DesignSystem.Colors.textSecondary)
-                .rotationEffect(.degrees(iconRotation))
-                .animation(DesignSystem.Animation.spring, value: iconRotation)
-                .onAppear {
-                    if isConnected {
-                        withAnimation(.easeInOut(duration: 1).repeatForever(autoreverses: true)) {
-                            iconRotation = 5
-                        }
-                    }
-                }
-            
-            Text("GigE Virtual Camera")
-                .font(DesignSystem.Typography.title)
-                .foregroundColor(DesignSystem.Colors.textPrimary)
-        }
-    }
 }
 
 // MARK: - Status Row
@@ -499,31 +557,38 @@ struct StreamStalledBanner: View {
         HStack(spacing: DesignSystem.Spacing.small) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 18, weight: .bold))
-                .foregroundColor(.white)
+                .foregroundColor(DesignSystem.Colors.textOnAccent)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Stream stalled — frames not flowing")
                     .font(DesignSystem.Typography.callout)
                     .fontWeight(.semibold)
-                    .foregroundColor(.white)
+                    .foregroundColor(DesignSystem.Colors.textOnAccent)
                 Text("No frame has been delivered in \(durationText)s. Recording may be losing data.")
                     .font(DesignSystem.Typography.caption)
-                    .foregroundColor(.white.opacity(0.9))
+                    .foregroundColor(DesignSystem.Colors.textOnAccent.opacity(0.9))
             }
             Spacer()
+            // Bold filled button so the recovery action reads as the primary
+            // CTA even on a saturated red banner -- the previous "white pill
+            // with red text" was visually muted on a red surface.
             Button(action: onRecover) {
-                Text("Reconnect")
-                    .font(DesignSystem.Typography.caption)
-                    .fontWeight(.semibold)
-                    .foregroundColor(.red)
-                    .padding(.horizontal, DesignSystem.Spacing.small)
-                    .padding(.vertical, 4)
-                    .background(Color.white)
-                    .cornerRadius(DesignSystem.CornerRadius.small)
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.clockwise")
+                    Text("Reconnect")
+                        .fontWeight(.semibold)
+                }
+                .font(DesignSystem.Typography.caption)
+                .foregroundColor(DesignSystem.Colors.statusError)
+                .padding(.horizontal, DesignSystem.Spacing.small)
+                .padding(.vertical, 5)
+                .background(DesignSystem.Colors.textOnAccent)
+                .cornerRadius(DesignSystem.CornerRadius.small)
+                .shadow(color: .black.opacity(0.2), radius: 1, y: 1)
             }
-            .buttonStyle(PlainButtonStyle())
+            .buttonStyle(.plain)
         }
         .padding(DesignSystem.Spacing.medium)
-        .background(Color.red)
+        .background(DesignSystem.Colors.statusError)
         .cornerRadius(DesignSystem.CornerRadius.medium)
     }
 }
@@ -546,16 +611,15 @@ struct VisualEffectBackground: NSViewRepresentable {
 // MARK: - Camera Preview Section
 
 struct CameraPreviewSection: View {
-    @Binding var previewImage: NSImage?
     @EnvironmentObject var cameraManager: CameraManager
     @StateObject private var frameHandler = PreviewFrameHandler()
-    @State private var hasAppeared = false
-    
+
     var body: some View {
         ZStack {
-            // Background
+            // True-black surface (intentionally non-adaptive -- pro video apps
+            // use black so colour grading isn't confused by ambient tint).
             RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
-                .fill(Color.black)
+                .fill(DesignSystem.Colors.videoSurface)
 
             if let image = frameHandler.currentImage {
                 Image(nsImage: image)
@@ -566,11 +630,11 @@ struct CameraPreviewSection: View {
             } else {
                 VStack {
                     ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                        .progressViewStyle(CircularProgressViewStyle(tint: DesignSystem.Colors.textOnAccent))
                         .scaleEffect(1.2)
-                    Text("Waiting for camera feed...")
+                    Text("Waiting for camera feed…")
                         .font(DesignSystem.Typography.caption)
-                        .foregroundColor(.white)
+                        .foregroundColor(DesignSystem.Colors.textOnAccent)
                         .padding(.top, DesignSystem.Spacing.small)
                 }
             }
@@ -581,33 +645,31 @@ struct CameraPreviewSection: View {
                 VStack {
                     HStack(spacing: DesignSystem.Spacing.xSmall) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.black)
                         Text("Preview stalled — last frame frozen")
                             .font(DesignSystem.Typography.caption)
                             .fontWeight(.semibold)
-                            .foregroundColor(.black)
                     }
+                    .foregroundColor(.black)
                     .padding(.horizontal, DesignSystem.Spacing.small)
                     .padding(.vertical, DesignSystem.Spacing.xSmall)
-                    .background(Color.yellow)
+                    .background(DesignSystem.Colors.statusWarning)
                     .cornerRadius(DesignSystem.CornerRadius.small)
                     .padding(.top, DesignSystem.Spacing.small)
                     Spacer()
                 }
             }
+
+            // Thin inner stroke gives the preview the feel of a pro monitor
+            // frame instead of "raw black rectangle".
+            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.medium)
+                .stroke(DesignSystem.Colors.border.opacity(0.6), lineWidth: 1)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .frame(minHeight: 280)
-        .onAppear {
-            print("CameraPreviewSection: ===== VIEW APPEARED =====")
-            hasAppeared = true
-            frameHandler.startReceivingFrames()
-        }
-        .onDisappear {
-            print("CameraPreviewSection: ===== VIEW DISAPPEARED =====")
-            hasAppeared = false
-            frameHandler.stopReceivingFrames()
-        }
+        // No onAppear/onDisappear: the preview is always rendered in the new
+        // two-column layout, so SwiftUI never fires those callbacks. The
+        // frame-handler closure is wired in PreviewFrameHandler.init() and
+        // lives for the WindowGroup's lifetime.
     }
 }
 
@@ -737,6 +799,17 @@ struct DiagnosticsDrawer: View {
     @EnvironmentObject var cameraManager: CameraManager
     @ObservedObject private var log = DiagnosticsLog.shared
     @State private var isExpanded = false
+    /// Brief "✓ Copied" / "✓ Saved" indicator shown next to the export
+    /// toolbar after a successful action. Cleared via a cancellable work
+    /// item so rapid Copy/Export clicks don't queue overlapping
+    /// `asyncAfter` blocks that fight to set/clear the label.
+    @State private var feedback: String?
+    @State private var feedbackClearWork: DispatchWorkItem?
+    /// Pending scroll-to-bottom work item. Replaced on each entries.count
+    /// change so 20 entries arriving in one second produce one animation,
+    /// not 20 -- the previous always-on `onChange { withAnimation { ... } }`
+    /// thrashed the main thread during heavy logging.
+    @State private var scrollDebounce: DispatchWorkItem?
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
@@ -744,7 +817,7 @@ struct DiagnosticsDrawer: View {
                 Toggle(isOn: liveBinding) {
                     HStack(spacing: DesignSystem.Spacing.xSmall) {
                         Image(systemName: log.isLive ? "dot.radiowaves.left.and.right" : "pause.circle")
-                            .foregroundColor(log.isLive ? .green : .gray)
+                            .foregroundColor(log.isLive ? DesignSystem.Colors.statusSuccess : DesignSystem.Colors.textSecondary)
                         Text("Live debugging")
                             .font(DesignSystem.Typography.callout)
                         Text(log.isLive ? "(polling this app's log every 1 s)" : "(off)")
@@ -767,13 +840,25 @@ struct DiagnosticsDrawer: View {
 
                 logScroll
 
+                // Two primary actions (Copy / Save), two secondary
+                // (Refresh / Clear) -- the previous 5-button toolbar made
+                // it hard to tell what was the canonical export action.
                 HStack(spacing: DesignSystem.Spacing.small) {
                     Button("Refresh") { log.loadInitialSnapshot() }
                     Button("Clear") { log.clear() }
                     Spacer()
-                    Button("Copy to clipboard") { copyToPasteboard() }
-                    Button("Export .txt") { exportTxt() }
-                    Button("Export .json") { exportJson() }
+                    if let feedback = feedback {
+                        Text(feedback)
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.statusSuccess)
+                            .transition(.opacity)
+                    }
+                    Button("Copy") { copyToPasteboard() }
+                    Menu("Save…") {
+                        Button("Save as .txt") { exportTxt() }
+                        Button("Save as .json") { exportJson() }
+                    }
+                    .fixedSize()
                 }
                 .font(DesignSystem.Typography.caption)
             }
@@ -788,10 +873,10 @@ struct DiagnosticsDrawer: View {
                     Text("LIVE")
                         .font(DesignSystem.Typography.caption)
                         .fontWeight(.semibold)
-                        .foregroundColor(.white)
+                        .foregroundColor(DesignSystem.Colors.textOnAccent)
                         .padding(.horizontal, DesignSystem.Spacing.xSmall)
                         .padding(.vertical, 2)
-                        .background(Color.green)
+                        .background(DesignSystem.Colors.statusSuccess)
                         .cornerRadius(DesignSystem.CornerRadius.small)
                 }
                 Spacer()
@@ -821,7 +906,7 @@ struct DiagnosticsDrawer: View {
                     if log.entries.isEmpty {
                         Text("No log entries yet. Turn on Live debugging to start capturing, or click Refresh to load the last 5 minutes.")
                             .font(DesignSystem.Typography.caption)
-                            .foregroundColor(.gray)
+                            .foregroundColor(DesignSystem.Colors.textSecondary)
                             .padding(DesignSystem.Spacing.small)
                     } else {
                         ForEach(log.entries) { entry in
@@ -832,15 +917,38 @@ struct DiagnosticsDrawer: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(height: 220)
-            .background(Color.black.opacity(0.35))
+            .background(DesignSystem.Colors.logSurface)
             .cornerRadius(DesignSystem.CornerRadius.small)
             .onChange(of: log.entries.count) { _ in
-                guard let last = log.entries.last else { return }
-                withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
+                scheduleScrollToBottom(proxy: proxy)
             }
         }
+    }
+
+    /// Coalesce scroll-to-bottom updates: replace any pending work item with
+    /// a new one that fires after a short delay, so bursts of log entries
+    /// (e.g., 20 in one polling tick) produce a single animation instead of
+    /// twenty overlapping ones.
+    private func scheduleScrollToBottom(proxy: ScrollViewProxy) {
+        scrollDebounce?.cancel()
+        let item = DispatchWorkItem {
+            guard let last = log.entries.last else { return }
+            withAnimation(.easeOut(duration: 0.15)) {
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+        }
+        scrollDebounce = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: item)
+    }
+
+    private func flashFeedback(_ text: String) {
+        feedbackClearWork?.cancel()
+        withAnimation { feedback = text }
+        let clear = DispatchWorkItem {
+            withAnimation { feedback = nil }
+        }
+        feedbackClearWork = clear
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: clear)
     }
 
     // MARK: - Export
@@ -851,6 +959,7 @@ struct DiagnosticsDrawer: View {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(text, forType: .string)
+        flashFeedback("✓ Copied")
     }
 
     private func exportTxt() {
@@ -875,6 +984,7 @@ struct DiagnosticsDrawer: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try data.write(to: url)
+            flashFeedback("✓ Saved")
         } catch {
             // Surface the failure visibly. The previous version only NSLog'd
             // it; users assumed the file was saved and would email us with
@@ -901,27 +1011,27 @@ struct DiagnosticsLogRow: View {
 
     private var levelColor: Color {
         switch entry.level {
-        case "ERROR", "FAULT": return .red
-        case "NOTICE": return .yellow
-        case "INFO": return .white
-        case "DEBUG": return .gray
-        default: return .gray
+        case "ERROR", "FAULT": return DesignSystem.Colors.logError
+        case "NOTICE":         return DesignSystem.Colors.logWarning
+        case "INFO":           return DesignSystem.Colors.logInfo
+        case "DEBUG":          return DesignSystem.Colors.logDebug
+        default:               return DesignSystem.Colors.logDebug
         }
     }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(Self.timeFormatter.string(from: entry.timestamp))
-                .foregroundColor(.gray)
+                .foregroundColor(DesignSystem.Colors.textSecondary)
             Text(entry.level)
                 .foregroundColor(levelColor)
                 .frame(width: 56, alignment: .leading)
             Text(entry.category)
-                .foregroundColor(.cyan)
+                .foregroundColor(DesignSystem.Colors.logCategory)
                 .frame(width: 110, alignment: .leading)
                 .lineLimit(1)
             Text(entry.message)
-                .foregroundColor(.white)
+                .foregroundColor(DesignSystem.Colors.logInfo)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }

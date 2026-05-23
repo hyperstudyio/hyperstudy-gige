@@ -22,13 +22,10 @@
 		949EB29990CE62FC17B020BD /* NetworkInterfaceMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF6BE2633D6C2FA2CC3E89C2 /* NetworkInterfaceMonitor.swift */; };
 		9E7E34ED3E312F662001A0DB /* AravisBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = 325D10A0755501761E5441E8 /* AravisBridge.mm */; };
 		AACA1C80D99BFF54D3C4A2E6 /* PixelBufferHelpers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BED1F750517D3B532E43A04 /* PixelBufferHelpers.swift */; };
-		AF4A0E92730A86ED0B4456B9 /* SharedMemoryFrameSharing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C41DAD3ECC805AB10C46ED3 /* SharedMemoryFrameSharing.swift */; };
 		D3A632A863EE95A66CD83039 /* CMIOFrameSender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43D9C615FB22B5ADC5572BA6 /* CMIOFrameSender.swift */; };
 		DF218341570648066EE4D859 /* CameraManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08987548898558EC7975B0D2 /* CameraManager.swift */; };
 		E30049982FBD70CD00C349F1 /* FramePipelineKit in Frameworks */ = {isa = PBXBuildFile; productRef = E30049972FBD70CD00C349F1 /* FramePipelineKit */; };
 		E9261B5C4B76BFF0975319CE /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 287F86C390310B151C81E5F0 /* DesignSystem.swift */; };
-		ECFB87687A5A53E7FD346356 /* IOSurfaceFrameWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B4DE4FFBE5D48C930D1759C /* IOSurfaceFrameWriter.swift */; };
-		EDC3A953D1F86A9121CFAF0D /* IOSurfaceFrameSharing.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0ABA500E74E58DA7AAFCC94 /* IOSurfaceFrameSharing.swift */; };
 		FC594C358FDF42D7C703E7C7 /* ExtensionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 272BC57E4EC81F46F8984161 /* ExtensionManager.swift */; };
 		FF2ED4EAB332C4A9E072E621 /* PixelBufferConverter.swift in Sources */ = {isa = PBXBuildFile; fileRef = D69EA7B08E39383581459407 /* PixelBufferConverter.swift */; };
 /* End PBXBuildFile section */
@@ -74,16 +71,13 @@
 		51BABE8A0E20F4FED4603299 /* com.lukechang.GigEVirtualCamera.Extension.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.lukechang.GigEVirtualCamera.Extension.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		5862471CC9AF42A7A4F31377 /* SystemExtensions.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemExtensions.framework; path = System/Library/Frameworks/SystemExtensions.framework; sourceTree = SDKROOT; };
 		5B545C2BFB14C5554212441D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-		6B4DE4FFBE5D48C930D1759C /* IOSurfaceFrameWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSurfaceFrameWriter.swift; sourceTree = "<group>"; };
 		861A155A665E0E1C1416DFF2 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-		8C41DAD3ECC805AB10C46ED3 /* SharedMemoryFrameSharing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedMemoryFrameSharing.swift; sourceTree = "<group>"; };
 		9477A35A51A416185BC0A615 /* GigECamera-Debug.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "GigECamera-Debug.entitlements"; sourceTree = "<group>"; };
 		9BED1F750517D3B532E43A04 /* PixelBufferHelpers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PixelBufferHelpers.swift; sourceTree = "<group>"; };
 		A19F5AC376905E28D984426A /* GigECameraApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GigECameraApp.swift; sourceTree = "<group>"; };
 		A84F71AC554427A9375C99C8 /* CMIOExtensionProperties.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CMIOExtensionProperties.swift; sourceTree = "<group>"; };
 		AF6BE2633D6C2FA2CC3E89C2 /* NetworkInterfaceMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkInterfaceMonitor.swift; sourceTree = "<group>"; };
 		C024BFEF3CAF28E089A772F0 /* CMIOPropertyListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CMIOPropertyListener.swift; sourceTree = "<group>"; };
-		C0ABA500E74E58DA7AAFCC94 /* IOSurfaceFrameSharing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSurfaceFrameSharing.swift; sourceTree = "<group>"; };
 		CF57E68AAC8B26D08650A0DF /* GigECamera-Release.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "GigECamera-Release.entitlements"; sourceTree = "<group>"; };
 		D69EA7B08E39383581459407 /* PixelBufferConverter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PixelBufferConverter.swift; sourceTree = "<group>"; };
 		DA0D776346DD1FED961B677F /* GigECameraManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GigECameraManager.swift; sourceTree = "<group>"; };
@@ -124,11 +118,8 @@
 				DA0D776346DD1FED961B677F /* GigECameraManager.swift */,
 				E213BC7702662D7BD1E43B14 /* GigEVirtualCamera-Bridging-Header.h */,
 				5B545C2BFB14C5554212441D /* Info.plist */,
-				C0ABA500E74E58DA7AAFCC94 /* IOSurfaceFrameSharing.swift */,
-				6B4DE4FFBE5D48C930D1759C /* IOSurfaceFrameWriter.swift */,
 				AF6BE2633D6C2FA2CC3E89C2 /* NetworkInterfaceMonitor.swift */,
 				D69EA7B08E39383581459407 /* PixelBufferConverter.swift */,
-				8C41DAD3ECC805AB10C46ED3 /* SharedMemoryFrameSharing.swift */,
 			);
 			path = GigECameraApp;
 			sourceTree = "<group>";
@@ -374,12 +365,9 @@
 				FC594C358FDF42D7C703E7C7 /* ExtensionManager.swift in Sources */,
 				56F45446257DB667908E2553 /* GigECameraApp.swift in Sources */,
 				81F05D49548AF55D7ADC4227 /* GigECameraManager.swift in Sources */,
-				EDC3A953D1F86A9121CFAF0D /* IOSurfaceFrameSharing.swift in Sources */,
-				ECFB87687A5A53E7FD346356 /* IOSurfaceFrameWriter.swift in Sources */,
 				949EB29990CE62FC17B020BD /* NetworkInterfaceMonitor.swift in Sources */,
 				FF2ED4EAB332C4A9E072E621 /* PixelBufferConverter.swift in Sources */,
 				AACA1C80D99BFF54D3C4A2E6 /* PixelBufferHelpers.swift in Sources */,
-				AF4A0E92730A86ED0B4456B9 /* SharedMemoryFrameSharing.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

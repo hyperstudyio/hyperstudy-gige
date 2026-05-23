@@ -34,6 +34,14 @@ class PixelBufferConverter {
     /// (re)building the pool only when dimensions change.
     private func dequeueYUVBuffer(width: Int, height: Int) -> CVPixelBuffer? {
         if pool == nil || width != poolWidth || height != poolHeight {
+            // Free any unused buffers the old pool was caching before we
+            // drop our reference. Without this, multiple resolution changes
+            // leave stale buffer caches alive in memory until ARC eventually
+            // tears the pool down -- observable as growing memory on every
+            // resolution toggle.
+            if let oldPool = pool {
+                CVPixelBufferPoolFlush(oldPool, .excessBuffers)
+            }
             let bufferAttrs: [CFString: Any] = [
                 kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                 kCVPixelBufferWidthKey: width,

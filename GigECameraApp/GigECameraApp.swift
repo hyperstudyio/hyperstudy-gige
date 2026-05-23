@@ -9,7 +9,11 @@ import SwiftUI
 
 @main
 struct GigECameraApp: App {
-    @StateObject private var cameraManager = CameraManager.shared
+    // CameraManager is a singleton, so @StateObject (which is for objects the
+    // view creates and owns) is the wrong wrapper -- it would prevent multiple
+    // WindowGroup instances from sharing the same manager. Hold it as a plain
+    // `let` and pass it down via .environmentObject().
+    private let cameraManager = CameraManager.shared
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     // Fixed window footprint. The two-column layout in ContentView is sized

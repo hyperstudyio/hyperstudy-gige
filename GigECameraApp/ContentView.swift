@@ -13,7 +13,11 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject var cameraManager: CameraManager
-    @StateObject private var extensionManager = ExtensionManager.shared
+    // ExtensionManager is a singleton (static let shared); wrap as
+    // @ObservedObject so SwiftUI subscribes to its @Published changes
+    // without taking ownership of its lifecycle. The previous @StateObject
+    // matched the anti-pattern that was fixed for CameraManager.
+    @ObservedObject private var extensionManager = ExtensionManager.shared
     @State private var isDiscoveringCameras = false
     /// Brief "✓ Refreshed" indicator next to the camera refresh button.
     /// Cleared via a cancellable work item so rapid clicks don't queue
@@ -192,11 +196,12 @@ struct ContentView: View {
         }
     }
 
-    /// Compact extension card. In normal operation users see only a status
-    /// dot + label; the Install / Uninstall actions live behind a Menu so
-    /// they don't dominate the panel, and any debug output is hidden by
-    /// default behind a disclosure (mirroring the Diagnostics drawer rather
-    /// than dumping monospaced text into the main UI).
+    /// Compact extension card. When the extension is not yet installed the
+    /// "Install Extension" action is surfaced as a prominent inline button
+    /// so first-launch users can't miss it; once installed, the ellipsis
+    /// menu hosts the rare Uninstall path. Debug output (when present)
+    /// hides behind a "Details" disclosure rather than dumping monospaced
+    /// text into the main UI.
     private var extensionStatusSection: some View {
         let status = extensionManager.extensionStatus
         let isInstalled = status == "Installed"
@@ -221,28 +226,52 @@ struct ContentView: View {
                     .font(DesignSystem.Typography.caption)
                     .fontWeight(.medium)
                     .foregroundColor(statusColor)
-                Menu {
-                    Button {
-                        extensionManager.installExtension()
+                // Ellipsis menu is only useful once installed (for Uninstall).
+                // Hide it on the first-launch path so the prominent Install
+                // button below is the only thing competing for attention.
+                if isInstalled {
+                    Menu {
+                        Button {
+                            extensionManager.uninstallExtension()
+                        } label: {
+                            Label("Uninstall Extension", systemImage: "minus.circle")
+                        }
+                        .disabled(extensionManager.isInstalling)
                     } label: {
-                        Label("Install Extension", systemImage: "plus.circle")
+                        Image(systemName: "ellipsis.circle")
+                            .foregroundColor(DesignSystem.Colors.textSecondary)
                     }
-                    .disabled(extensionManager.isInstalling || isInstalled)
-
-                    Button {
-                        extensionManager.uninstallExtension()
-                    } label: {
-                        Label("Uninstall Extension", systemImage: "minus.circle")
-                    }
-                    .disabled(extensionManager.isInstalling || !isInstalled)
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .foregroundColor(DesignSystem.Colors.textSecondary)
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Manage extension")
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("Manage extension")
+            }
+
+            // Primary call-to-action when the extension isn't installed.
+            // Lab techs setting up a new machine see this immediately
+            // instead of having to discover an ellipsis menu.
+            if !isInstalled {
+                Button {
+                    extensionManager.installExtension()
+                } label: {
+                    HStack(spacing: 4) {
+                        if extensionManager.isInstalling {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: DesignSystem.Colors.textOnAccent))
+                                .scaleEffect(0.55)
+                                .frame(width: 12, height: 12)
+                            Text("Installing…")
+                        } else {
+                            Image(systemName: "plus.circle.fill")
+                            Text("Install Extension")
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(extensionManager.isInstalling)
             }
 
             if needsApproval {
@@ -733,18 +762,6 @@ class PreviewFrameHandler: ObservableObject {
         }
     }
 
-    func startReceivingFrames() {
-        print("PreviewFrameHandler: Starting to receive frames")
-        // The callback is already registered from init(). All we do here is
-        // make sure the camera is streaming so frames actually flow.
-        if !gigEManager.isStreaming {
-            print("PreviewFrameHandler: Starting streaming...")
-            gigEManager.startStreaming()
-        } else {
-            print("PreviewFrameHandler: Already streaming")
-        }
-    }
-    
     private func setupFrameHandler() {
         print("PreviewFrameHandler: Setting up frame handler")
 
@@ -777,13 +794,11 @@ class PreviewFrameHandler: ObservableObject {
         print("PreviewFrameHandler: Frame handler added")
     }
 
-    func stopReceivingFrames() {
-        print("PreviewFrameHandler: Stopping frame reception after \(frameCount) frames")
-        // Detach the preview only. The stream path is independent and must keep
-        // running for any recording consumer, so do NOT stop streaming here.
-        gigEManager.onPreviewFrame = nil
-        frameCount = 0
-    }
+    // No public start/stop API: the preview is always rendered in the new
+    // two-column layout and the frame-handler closure is wired in init(),
+    // so SwiftUI lifecycle callbacks never need to attach/detach it. The
+    // closure is torn down when the @StateObject deinits at WindowGroup
+    // close, which is the only path that matters.
 }
 
 // MARK: - Diagnostics Drawer

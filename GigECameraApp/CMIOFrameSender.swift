@@ -362,6 +362,13 @@ class CMIOSinkConnector {
         // reference and MUST release it or the sample buffer leaks. At a 6-
         // frame queue and 30 fps streaming, queue-full is not rare during
         // brief consumer stalls and the leak is observable in long sessions.
+        //
+        // Important: `Unmanaged` is a struct value type and `.toOpaque()`
+        // does NOT consume it -- it just returns the opaque pointer. So
+        // the `unmanaged` value below is still well-defined and safe to
+        // `.release()` in the failure branch. A future refactor that
+        // inlines `Unmanaged.passRetained(sampleBuffer).toOpaque()` and
+        // tries to release a separately captured value would double-free.
         let unmanaged = Unmanaged.passRetained(sampleBuffer)
         let result = CMSimpleQueueEnqueue(queue, element: unmanaged.toOpaque())
 

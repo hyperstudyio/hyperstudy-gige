@@ -1192,6 +1192,11 @@ final class DiagnosticsLog: ObservableObject {
     @Published private(set) var isLive: Bool = false
 
     private let maxEntries = 1000
+    /// Hard cap on entries pulled in any single fetch. The AravisBridge logs
+    /// ~50 entries/sec at 30 fps; a multi-second window can easily produce
+    /// 10k+ entries, which blocks the OSLogStore enumeration and then dumps
+    /// a giant batch onto the main thread, freezing the drawer.
+    private let perFetchEntryLimit = 250
     private let subsystem = CameraConstants.BundleID.app
     private var pollTimer: Timer?
 
@@ -1205,14 +1210,18 @@ final class DiagnosticsLog: ObservableObject {
 
     private init() {}
 
-    /// Pull the last 5 minutes of log entries once. Safe to call repeatedly --
-    /// idempotent because the cursor advances past anything already fetched.
+    /// Pull a short, recent slice of log entries. NOT called on view appear
+    /// any more -- the AravisBridge generates ~50 entries/sec while streaming,
+    /// and dumping a multi-minute window when the user opens the drawer
+    /// caused a perceptible freeze. The drawer starts empty; the user clicks
+    /// "Refresh" to load recent context, or toggles "Live" to stream new
+    /// entries as they arrive.
     func loadInitialSnapshot() {
         pollQueue.async { [weak self] in
             guard let self = self else { return }
-            if self.cursorDate == .distantPast {
-                self.cursorDate = Date().addingTimeInterval(-300)
-            }
+            // Always reset to a small recent window so Refresh is fast even
+            // if the user clicks it repeatedly.
+            self.cursorDate = Date().addingTimeInterval(-15)
             self.fetchOnPollQueue()
         }
     }
@@ -1222,9 +1231,9 @@ final class DiagnosticsLog: ObservableObject {
         isLive = true
         pollQueue.async { [weak self] in
             guard let self = self else { return }
-            if self.cursorDate == .distantPast {
-                self.cursorDate = Date().addingTimeInterval(-60)
-            }
+            // Live starts capturing from "now" so toggling on doesn't dump
+            // recent history that the user didn't ask for.
+            self.cursorDate = Date()
         }
         // Timer fires on the main RunLoop; the actual log read hops to
         // `pollQueue` so a slow OSLogStore query never blocks the UI.
@@ -1273,7 +1282,14 @@ final class DiagnosticsLog: ObservableObject {
         let predicate = NSPredicate(format: "subsystem == %@", subsystem)
         guard let stored = try? store.getEntries(at: position, matching: predicate) else { return }
 
+        // Hard cap the iteration: when the AravisBridge is logging ~50 entries
+        // per second, the user clicking Refresh after a minute of streaming
+        // would otherwise pull 3000+ entries in one batch and block the main
+        // thread when SwiftUI diffs the resulting ForEach update. Stopping
+        // early keeps the UI responsive; the next Refresh will pick up from
+        // where this one stopped (cursor advances to last fetched entry).
         var fetched: [Entry] = []
+        fetched.reserveCapacity(perFetchEntryLimit)
         for entry in stored {
             guard let logEntry = entry as? OSLogEntryLog else { continue }
             guard logEntry.date > cursor else { continue }
@@ -1283,6 +1299,7 @@ final class DiagnosticsLog: ObservableObject {
                 category: logEntry.category,
                 message: logEntry.composedMessage
             ))
+            if fetched.count >= perFetchEntryLimit { break }
         }
 
         guard let last = fetched.last else { return }

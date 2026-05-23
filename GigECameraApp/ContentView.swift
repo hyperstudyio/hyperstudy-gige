@@ -657,15 +657,7 @@ struct CameraPreviewSection: View {
                     .cornerRadius(DesignSystem.CornerRadius.medium)
                     .padding(DesignSystem.Spacing.xSmall)
             } else {
-                VStack {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: DesignSystem.Colors.textOnAccent))
-                        .scaleEffect(1.2)
-                    Text("Waiting for camera feed…")
-                        .font(DesignSystem.Typography.caption)
-                        .foregroundColor(DesignSystem.Colors.textOnAccent)
-                        .padding(.top, DesignSystem.Spacing.small)
-                }
+                emptyPreviewState
             }
 
             // Stall overlay. We deliberately keep `currentImage` visible
@@ -699,6 +691,49 @@ struct CameraPreviewSection: View {
         // two-column layout, so SwiftUI never fires those callbacks. The
         // frame-handler closure is wired in PreviewFrameHandler.init() and
         // lives for the WindowGroup's lifetime.
+    }
+
+    /// State-aware preview empty state. The previous design always showed a
+    /// spinning ProgressView, which made the app feel "busy" before the user
+    /// had even done anything. Now we read `cameraManager` state and only
+    /// animate when something is actually happening:
+    ///
+    /// - No camera selected → static camera icon + "Select a camera to begin"
+    /// - Connecting          → spinner + "Connecting…"
+    /// - Connected, no frame → spinner + "Waiting for first frame…"
+    @ViewBuilder
+    private var emptyPreviewState: some View {
+        if cameraManager.connectionState == "Connecting" {
+            VStack(spacing: DesignSystem.Spacing.small) {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: DesignSystem.Colors.textOnAccent))
+                Text("Connecting to camera…")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(DesignSystem.Colors.textOnAccent)
+            }
+        } else if cameraManager.isConnected {
+            // Camera reports connected but no frame has been rendered yet --
+            // briefly true at startup between connect and the first frame
+            // arriving via the preview slot.
+            VStack(spacing: DesignSystem.Spacing.small) {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: DesignSystem.Colors.textOnAccent))
+                Text("Waiting for first frame…")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(DesignSystem.Colors.textOnAccent)
+            }
+        } else {
+            VStack(spacing: DesignSystem.Spacing.small) {
+                Image(systemName: "camera")
+                    .font(.system(size: 36, weight: .light))
+                    .foregroundColor(DesignSystem.Colors.textOnAccent.opacity(0.45))
+                Text(cameraManager.availableCameras.isEmpty
+                     ? "No cameras found on the network"
+                     : "Select a camera to begin")
+                    .font(DesignSystem.Typography.caption)
+                    .foregroundColor(DesignSystem.Colors.textOnAccent.opacity(0.7))
+            }
+        }
     }
 }
 
@@ -902,7 +937,11 @@ struct DiagnosticsDrawer: View {
                 }
             }
         }
-        .onAppear { log.loadInitialSnapshot() }
+        // Intentionally NO .onAppear { loadInitialSnapshot() }. The
+        // AravisBridge logs ~50 entries/sec while the camera is streaming;
+        // auto-loading recent history on the very first app launch made the
+        // drawer freeze when expanded. Users now explicitly opt in by
+        // clicking Refresh (small bounded fetch) or toggling Live.
     }
 
     private var liveBinding: Binding<Bool> {

@@ -354,18 +354,43 @@ jobs:
 
           echo "DMG notarization completed successfully"
 
+      - name: Generate release notes from commit log
+        id: release_notes
+        # GitHub's `generate_release_notes: true` only lists PRs merged since
+        # the previous tag and silently drops any direct-to-main commits.
+        # We push directly to main often, so that produces near-empty notes.
+        # Build the list from `git log` between tags instead so every commit
+        # subject is visible in the release body and on docs.hyperstudy.io.
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          PREV_TAG=$(git tag --sort=-version:refname \
+                     | grep -E '^v[0-9]' \
+                     | grep -v "^${VERSION}$" \
+                     | head -n1)
+
+          NOTES_FILE="$RUNNER_TEMP/release_notes.md"
+          {
+            echo "## What's Changed"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              git log --no-merges --pretty='* %s' "${PREV_TAG}..${VERSION}"
+              echo ""
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${VERSION}"
+            else
+              git log --no-merges --pretty='* %s' "${VERSION}"
+            fi
+          } > "$NOTES_FILE"
+
+          echo "Generated release notes ($(wc -l <"$NOTES_FILE") lines)"
+          cat "$NOTES_FILE"
+
       - name: Create GitHub Release
-        # The body is generated entirely by GitHub's auto-generated release-
-        # notes (PR list + full changelog link). Static installation/requirements
-        # boilerplate intentionally NOT included here -- it lives in the docs
-        # page (docs.hyperstudy.io) and was duplicating across every release,
-        # cluttering both github.com/.../releases and the synced docs page.
         uses: softprops/action-gh-release@v1
         with:
           files: build/distribution/GigEVirtualCamera-${{ steps.version.outputs.VERSION }}.dmg
+          body_path: ${{ runner.temp }}/release_notes.md
           draft: false
           prerelease: false
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

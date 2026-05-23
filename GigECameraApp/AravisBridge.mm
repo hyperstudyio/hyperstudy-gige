@@ -492,9 +492,11 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
             ArvBufferStatus status = arv_buffer_get_status(buffer);
             if (status == ARV_BUFFER_STATUS_SUCCESS) {
                 frameCount++;
-                if (frameCount % 30 == 1) {
-                    NSLog(@"AravisBridge: Received frame %d", frameCount);
-                }
+                // Per-frame and once-per-second NSLogs removed. The
+                // CMIOSinkConnector logs frame counts once per second at
+                // info level; duplicating it here just floods the unified
+                // log and makes the Diagnostics drawer noisy. Errors and
+                // state transitions below still log normally.
                 [self processBuffer:buffer];
             } else {
                 NSLog(@"AravisBridge: Buffer status error: %d", status);
@@ -651,15 +653,13 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
         static int delegateCallCount = 0;
         delegateCallCount++;
 
-        // Log IOSurface info
+        // Only log the no-IOSurface case (which would indicate a fast path
+        // regression). The successful-delivery message was firing once per
+        // second and duplicating CMIOSinkConnector's downstream sink-send
+        // log, so it just added noise to the unified log.
         IOSurfaceRef surface = CVPixelBufferGetIOSurface(pixelBuffer);
-        if (delegateCallCount % 30 == 1) {
-            if (surface) {
-                IOSurfaceID surfaceID = IOSurfaceGetID(surface);
-                NSLog(@"AravisBridge: Calling delegate with frame #%d (IOSurface ID: %u)", delegateCallCount, surfaceID);
-            } else {
-                NSLog(@"AravisBridge: WARNING - Frame #%d has no IOSurface!", delegateCallCount);
-            }
+        if (!surface && delegateCallCount % 30 == 1) {
+            NSLog(@"AravisBridge: WARNING - Frame #%d has no IOSurface!", delegateCallCount);
         }
 
         // Deliver synchronously on the frame queue. The delegate fan-out is a

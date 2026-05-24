@@ -1104,6 +1104,15 @@ struct DiagnosticsDrawer: View {
             .replacingOccurrences(of: ":", with: "-")
         panel.nameFieldStringValue = "gige-diagnostics-\(stamp).\(suggestedExt)"
         panel.canCreateDirectories = true
+        // Default to ~/Downloads (where users expect to find exports). macOS
+        // will still remember the last-used location across saves within a
+        // session, so picking a different folder once "sticks".
+        if let downloads = try? FileManager.default.url(
+            for: .downloadsDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false
+        ) {
+            panel.directoryURL = downloads
+        }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try data.write(to: url)

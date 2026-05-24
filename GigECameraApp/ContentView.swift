@@ -479,13 +479,20 @@ struct ContentView: View {
             DisclosureGroup(isExpanded: $slidersExpanded) {
                 VStack(spacing: DesignSystem.Spacing.small) {
                     if cameraManager.exposureTimeAvailable {
+                        // No `step:` here: exposure ranges span ~100 µs to
+                        // ~100 ms (default 100…100000). With step:1 SwiftUI
+                        // asks AppKit to lay out ~99,900 tick marks, and
+                        // NSSlider's tick-mark rebuild allocates ~1M tiny
+                        // CoreUI objects and freezes the main thread for many
+                        // seconds. The displayed value is rounded to Int µs
+                        // anyway, and the camera API takes a Double, so we
+                        // lose nothing by leaving the slider continuous.
                         sliderRow(
                             label: "Exposure",
                             icon: "timer",
                             value: "\(Int(cameraManager.exposureTime)) µs",
                             binding: $cameraManager.exposureTime,
-                            range: cameraManager.exposureTimeMin...cameraManager.exposureTimeMax,
-                            step: 1
+                            range: cameraManager.exposureTimeMin...cameraManager.exposureTimeMax
                         )
                     }
                     if cameraManager.gainAvailable {
@@ -528,7 +535,7 @@ struct ContentView: View {
 
     private func sliderRow(label: String, icon: String, value: String,
                            binding: Binding<Double>, range: ClosedRange<Double>,
-                           step: Double) -> some View {
+                           step: Double? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Label(label, systemImage: icon)
@@ -540,8 +547,19 @@ struct ContentView: View {
                     .foregroundColor(DesignSystem.Colors.textPrimary)
                     .monospacedDigit()
             }
-            Slider(value: binding, in: range, step: step)
-                .controlSize(.small)
+            // Passing `step:` to SwiftUI's Slider asks AppKit to draw
+            // `(max-min)/step + 1` tick marks. For wide ranges this freezes
+            // the main thread (NSSliderTickMarks._rebuildTickMarkRectCache is
+            // O(N) with per-tick CoreUI rendering). Callers with wide ranges
+            // pass `step: nil` to opt out.
+            Group {
+                if let step {
+                    Slider(value: binding, in: range, step: step)
+                } else {
+                    Slider(value: binding, in: range)
+                }
+            }
+            .controlSize(.small)
         }
     }
 

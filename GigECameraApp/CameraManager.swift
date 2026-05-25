@@ -898,6 +898,23 @@ class CameraManager: NSObject, ObservableObject {
             return
         }
 
+        // Don't flag a stall if the only "successful" sends were the initial
+        // CMSimpleQueue fill with no consumer reading. The sink queue holds
+        // ~6 frames; with no consumer attached (no QuickTime / Zoom / etc.
+        // open against the virtual camera), the first ~6 enqueues succeed
+        // and every subsequent send returns kCMSimpleQueueError_QueueIsFull
+        // forever. That's not a stall — it's an idle camera waiting for a
+        // consumer. Only flag once a real consumer has drained the queue
+        // enough times that the session count is well past the queue depth.
+        let sessionSendCount = sinkConnector.sessionSendCount
+        let consumerActiveThreshold: UInt64 = 30  // ~1 second at 30 fps
+        guard sessionSendCount > consumerActiveThreshold else {
+            if streamStalled { streamStalled = false }
+            if streamStallDurationSec != 0 { streamStallDurationSec = 0 }
+            hasAttemptedRecoveryThisStall = false
+            return
+        }
+
         let elapsedNs = nowUptimeNs &- lastSendNs
         let elapsedSec = Double(elapsedNs) / 1_000_000_000.0
         let timedOut = elapsedSec > streamStallTimeoutSec

@@ -95,6 +95,15 @@ class CMIOSinkConnector {
     // Monotonic-nudge counter for the manifest / debug logs.
     private var _nonMonotonicNudges: UInt64 = 0
 
+    // Successful enqueues since the current sink session started (resets in
+    // connectToSinkStream). The stall watchdog uses this to distinguish a
+    // genuine stall from "queue filled because no consumer is reading":
+    // with no consumer, the first ~6 frames fill the sink's CMSimpleQueue
+    // and every subsequent enqueue returns kCMSimpleQueueError_QueueIsFull,
+    // so the count stays near the queue capacity. A real consumer drains
+    // the queue and the count grows continuously.
+    private var _sessionSendCount: UInt64 = 0
+
     private var livenessLock = os_unfair_lock()
 
     /// Thread-safe accessor for the watchdog. Returns 0 if no frame has ever
@@ -111,6 +120,17 @@ class CMIOSinkConnector {
         os_unfair_lock_lock(&livenessLock)
         defer { os_unfair_lock_unlock(&livenessLock) }
         return _nonMonotonicNudges
+    }
+
+    /// Successful enqueues since the current sink session started. The stall
+    /// watchdog only flags a stall once this exceeds a threshold roughly an
+    /// order of magnitude larger than the sink queue's capacity, so initial
+    /// queue-fill (with no consumer attached) doesn't get reported as a
+    /// stall — it's just an idle state, no consumer is reading the camera.
+    var sessionSendCount: UInt64 {
+        os_unfair_lock_lock(&livenessLock)
+        defer { os_unfair_lock_unlock(&livenessLock) }
+        return _sessionSendCount
     }
 
     // Stream state monitoring
@@ -271,6 +291,7 @@ class CMIOSinkConnector {
         _lastPtsNs = 0
         _lastSuccessfulSendUptimeNs = 0
         _nonMonotonicNudges = 0
+        _sessionSendCount = 0
         os_unfair_lock_unlock(&livenessLock)
 
         isConnected = true
@@ -375,10 +396,13 @@ class CMIOSinkConnector {
         if result == noErr {
             frameCount += 1
 
-            // Update liveness so the watchdog knows frames are flowing.
+            // Update liveness so the watchdog knows frames are flowing, and
+            // bump the session send count so it can distinguish a true stall
+            // from initial queue-fill with no consumer attached.
             let nowUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             os_unfair_lock_lock(&livenessLock)
             _lastSuccessfulSendUptimeNs = nowUptimeNs
+            _sessionSendCount &+= 1
             os_unfair_lock_unlock(&livenessLock)
 
             // Log periodically

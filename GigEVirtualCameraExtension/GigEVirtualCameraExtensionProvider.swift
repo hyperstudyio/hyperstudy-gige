@@ -12,38 +12,55 @@ import os.log
 
 // MARK: - Stream State Coordinator
 
+/// Writes to the shared `StreamState` dict that the app observes.
+///
+/// The mutation logic is duplicated in `FramePipelineKit/StreamStateMutation.swift`
+/// so it can be unit-tested. Keep both in sync if you change one.
+///
+/// Why merge instead of replace: source.startStream sets
+/// `newClientConnected = true`, then immediately calls
+/// `deviceSource.startStreaming()` which may call `signalNeedFrames()`. The
+/// previous implementation replaced the entire dict in `signalNeedFrames`,
+/// erasing `newClientConnected` before the app could observe it. That broke
+/// the recovery path the app relies on when its sink is disconnected.
 class StreamStateCoordinator {
     private let logger = Logger(subsystem: "com.lukechang.GigEVirtualCamera.Extension", category: "StreamState")
     private let appGroupID = "group.S368GH6KF7.com.lukechang.GigEVirtualCamera"
-    
+    static let stateKey = "StreamState"
+
     private var groupDefaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
     }
-    
+
     func signalNeedFrames() {
         guard let defaults = groupDefaults else {
             logger.error("Failed to access App Group UserDefaults")
             return
         }
-        
-        let state = [
-            "streamActive": true,
-            "timestamp": Date().timeIntervalSince1970,
-            "pid": ProcessInfo.processInfo.processIdentifier
-        ] as [String : Any]
-        
-        defaults.set(state, forKey: "StreamState")
+        let existing = defaults.dictionary(forKey: Self.stateKey) ?? [:]
+        var merged = existing
+        merged["streamActive"] = true
+        merged["timestamp"] = Date().timeIntervalSince1970
+        merged["pid"] = ProcessInfo.processInfo.processIdentifier
+        defaults.set(merged, forKey: Self.stateKey)
         defaults.synchronize()
-        
+
         logger.info("Signaled app to start sending frames")
     }
-    
+
+    /// Clears the active flag but preserves `newClientConnected` and other
+    /// transient flags the app may still need to observe. Previously this
+    /// removed the entire dict, which caused the app's handler to early-return
+    /// (no observable transition) and silently leave Aravis streaming.
     func signalStreamStopped() {
         guard let defaults = groupDefaults else { return }
-        
-        defaults.removeObject(forKey: "StreamState")
+        let existing = defaults.dictionary(forKey: Self.stateKey) ?? [:]
+        var merged = existing
+        merged["streamActive"] = false
+        merged["timestamp"] = Date().timeIntervalSince1970
+        defaults.set(merged, forKey: Self.stateKey)
         defaults.synchronize()
-        
+
         logger.info("Signaled app to stop sending frames")
     }
 }
@@ -138,120 +155,144 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
         guard let deviceSource = device.source as? GigEVirtualCameraExtensionDeviceSource else {
             throw NSError(domain: "GigEVirtualCamera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid device source"])
         }
-        
+
         logger.info("Stopping sink stream")
-        
-        // Stop subscribing
-        isSubscribing = false
-        
+
+        // Stop subscribing via the lock-protected setter so the consumer
+        // queue's next tick observes the change.
+        _ = setSubscribing(false)
+
         // Notify device source that sink is stopping
         deviceSource.stopSinkStreaming()
     }
     
+    // Subscription state. Reads and writes happen from at least two contexts
+    // (CMIO callback queue + main runloop retries), so we guard with a lock.
     private var isSubscribing = false
-    
+    private var subscribeLock = os_unfair_lock()
+
+    // Consumer queue. Previously every continuation was dispatched to .main,
+    // both flooding the UI thread and (in the error path) creating a
+    // self-perpetuating retry loop that could pin the runloop in a tight
+    // failure cycle. Now retries hop through a dedicated serial queue so
+    // they can't starve user-facing work.
+    private let consumerQueue = DispatchQueue(
+        label: "com.lukechang.GigEVirtualCamera.Extension.consumer",
+        qos: .userInteractive
+    )
+
+    // Error budget. CMIO can deliver many error callbacks in quick succession
+    // (e.g., the app's client disappeared). Without a budget the .asyncAfter
+    // retry on every error degenerates into a self-perpetuating loop.
+    private var consecutiveErrorCount = 0
+    private static let maxConsecutiveErrors = 8
+
+    private func setSubscribing(_ value: Bool) -> Bool {
+        os_unfair_lock_lock(&subscribeLock)
+        defer { os_unfair_lock_unlock(&subscribeLock) }
+        let oldValue = isSubscribing
+        isSubscribing = value
+        return oldValue
+    }
+
+    private func isStillSubscribing() -> Bool {
+        os_unfair_lock_lock(&subscribeLock)
+        defer { os_unfair_lock_unlock(&subscribeLock) }
+        return isSubscribing
+    }
+
     private func subscribe() throws {
         guard let client = self.client else {
             logger.error("No client available for subscription")
-            NSLog("❌❌❌ No client available for subscription")
             return
         }
-        
-        guard !isSubscribing else { 
+
+        let wasSubscribing = setSubscribing(true)
+        guard !wasSubscribing else {
             logger.warning("Already subscribing - skipping duplicate subscription")
-            return 
+            return
         }
-        isSubscribing = true
-        
+        consecutiveErrorCount = 0
+
         logger.info("🔵 Sink subscribing to consume buffers from client PID: \(client.pid)")
-        NSLog("🔵🔵🔵 SINK SUBSCRIBING - Client PID: \(client.pid)")
-        
+
         // Start consuming buffers - this will be called repeatedly by CMIO
-        consumeNextBuffer()
+        scheduleConsumeNextBuffer(after: 0)
     }
-    
-    private func consumeNextBuffer() {
-        guard isSubscribing, let client = self.client else { 
-            NSLog("⚠️⚠️⚠️ Stopping consumption - subscribing: \(isSubscribing), client: \(client != nil)")
-            return 
+
+    /// Schedules a call to `consumeNextBuffer` on the consumer queue. Replaces
+    /// the previous synchronous recursion (stack growth) and per-call
+    /// `DispatchQueue.main.asyncAfter` (UI-thread starvation + runloop pin).
+    private func scheduleConsumeNextBuffer(after delay: TimeInterval) {
+        guard isStillSubscribing() else { return }
+        if delay <= 0 {
+            consumerQueue.async { [weak self] in self?.consumeNextBuffer() }
+        } else {
+            consumerQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.consumeNextBuffer()
+            }
         }
-        
-        // Consume buffers from the client
-        stream.consumeSampleBuffer(from: client) { [weak self] (sampleBuffer, sequenceNumber, discontinuity, hasMoreSampleBuffers, error) in
-            guard let self = self else {
-                NSLog("❌❌❌ self is nil in callback")
-                return
-            }
-            
+    }
+
+    private func consumeNextBuffer() {
+        guard isStillSubscribing(), let client = self.client else { return }
+
+        stream.consumeSampleBuffer(from: client) { [weak self] (sampleBuffer, sequenceNumber, _, hasMoreSampleBuffers, error) in
+            guard let self = self else { return }
+            guard self.isStillSubscribing() else { return }
+
             if let error = error {
-                NSLog("❌❌❌ Error consuming sample buffer: \(error.localizedDescription)")
-                self.logger.error("❌ Error consuming sample buffer: \(error.localizedDescription)")
-                
-                // Try to recover by re-subscribing after a delay
-                if self.isSubscribing {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        self.consumeNextBuffer()
-                    }
+                self.consecutiveErrorCount &+= 1
+                let count = self.consecutiveErrorCount
+                self.logger.error("❌ Error consuming sample buffer (#\(count)): \(error.localizedDescription)")
+
+                if count >= Self.maxConsecutiveErrors {
+                    // The client connection is dead. Tear down the subscription
+                    // so the runloop is freed; CMIO will call stopStream when
+                    // the app's sink handle finally closes, or a fresh
+                    // startStream will reset everything.
+                    self.logger.error("Giving up after \(count) consecutive errors; stopping consumption")
+                    _ = self.setSubscribing(false)
+                    return
                 }
+
+                // Exponential backoff: 100ms, 200ms, 400ms, ... up to ~2s.
+                let backoff = min(2.0, 0.1 * pow(2.0, Double(count - 1)))
+                self.scheduleConsumeNextBuffer(after: backoff)
                 return
             }
-            
+
+            // Successful read clears the error budget.
+            self.consecutiveErrorCount = 0
+
             if let sampleBuffer = sampleBuffer {
-                // We have a real frame!
-                NSLog("✅✅✅ consumeSampleBuffer received REAL frame! seq:\(sequenceNumber) hasMore:\(hasMoreSampleBuffers)")
-                
-                // Write debug marker for first frame
                 if sequenceNumber == 0 {
                     if let groupDefaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera") {
                         groupDefaults.set("First frame received at \(Date())", forKey: "Debug_FirstFrameReceived")
                         groupDefaults.synchronize()
                     }
                 }
-                
-                // Log periodically for debugging
-                if sequenceNumber % 30 == 0 {
-                    // Get format info from the sample buffer
-                    if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) {
-                        let dimensions = CMVideoFormatDescriptionGetDimensions(formatDesc)
-                        let pixelFormat = CMFormatDescriptionGetMediaSubType(formatDesc)
-                        let formatString = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? "YUV420v" : 
-                                         pixelFormat == kCVPixelFormatType_32BGRA ? "BGRA" : "Unknown(\(pixelFormat))"
-                        NSLog("✅✅✅ Sink received frame #\(sequenceNumber) | \(dimensions.width)x\(dimensions.height) | Format: \(formatString)")
-                        self.logger.info("✅ Sink received frame #\(sequenceNumber) | \(dimensions.width)x\(dimensions.height) | Format: \(formatString)")
-                    } else {
-                        NSLog("✅✅✅ Sink received frame #\(sequenceNumber)")
-                        self.logger.info("✅ Sink received frame #\(sequenceNumber) | hasMore: \(hasMoreSampleBuffers)")
-                    }
+
+                if sequenceNumber % 300 == 0 {
+                    // Per-frame NSLog calls are synchronous IPC and were
+                    // costing ~150 calls/s at 30 fps. Sample once every 10
+                    // seconds instead.
+                    self.logger.info("Sink received frame #\(sequenceNumber)")
                 }
-                
-                // Check if we have a consumer
+
                 if let consumeCallback = self.consumeSampleBuffer {
-                    NSLog("📤📤📤 Forwarding frame #\(sequenceNumber) to DeviceSource")
-                    self.logger.debug("Forwarding frame to DeviceSource...")
                     consumeCallback(sampleBuffer)
-                } else {
-                    self.logger.warning("⚠️ No consumer callback set - frame will be dropped!")
-                    NSLog("⚠️⚠️⚠️ No consumer callback set!")
                 }
-                
-                // Continue consuming immediately if there are more buffers
-                if self.isSubscribing && hasMoreSampleBuffers {
-                    self.consumeNextBuffer()
-                } else if self.isSubscribing {
-                    // No more buffers right now, wait a bit before checking again
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.033) { // ~30fps
-                        self.consumeNextBuffer()
-                    }
-                }
+
+                // Keep draining without growing the stack. Even when
+                // hasMoreSampleBuffers is true, we hop through the consumer
+                // queue rather than synchronously recursing inside CMIO's
+                // own callback frame (which previously risked stack growth
+                // proportional to the queue depth).
+                self.scheduleConsumeNextBuffer(after: hasMoreSampleBuffers ? 0 : 0.033)
             } else {
-                // Nil buffer means queue is empty
-                // Don't log this as it's normal when queue is empty
-                // Just wait and try again
-                if self.isSubscribing {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.033) { // ~30fps
-                        self.consumeNextBuffer()
-                    }
-                }
+                // Queue empty — poll at ~30 fps.
+                self.scheduleConsumeNextBuffer(after: 0.033)
             }
         }
     }
@@ -277,7 +318,19 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
 
     // Mach-uptime ns of the last real (non-default) frame successfully sent.
     // The watchdog suppresses itself while this is fresh (< 2s old).
+    // Protected by `sendLock`.
     private var lastRealFrameUptimeNs: UInt64 = 0
+
+    // Last hostTime value handed to stream.send(). CMIO consumers freeze on
+    // non-monotonic hostTimes, and three producers can call sendSampleBuffer
+    // concurrently: the sink-to-source bridge (CMIO queue), the no-frame
+    // watchdog (main runloop), and the startStream bootstrap (main async).
+    // Even when all three read CLOCK_UPTIME_RAW, two threads can sample the
+    // same nanosecond or arrive at stream.send out of scheduling order.
+    // sendSampleBuffer clamps every emit to max(now, lastSentHostTimeNs+1).
+    // Mirrors the unit-tested logic in FramePipelineKit/MonotonicHostClock.
+    private var lastSentHostTimeNs: UInt64 = 0
+    private var sendLock = os_unfair_lock()
 
     // Keep reference to last frame for new clients
     private var lastReceivedFrame: CMSampleBuffer?
@@ -445,11 +498,15 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
     // pattern to become the next bootstrap) and they do NOT update
     // `lastRealFrameUptimeNs` (so the watchdog stays armed).
     //
-    // `hostTimeInNanoseconds` MUST be drawn from a single monotonic clock
-    // (CLOCK_UPTIME_RAW, the same source the app's capture path uses) for both
-    // real and default frames. Mixing CMSampleBuffer PTS (capture time) with
-    // host-time clock (send time) is what previously made CMIO clients freeze
-    // on non-monotonic timestamps.
+    // Concurrency: this method can be called from the CMIO callback queue
+    // (real-frame path via the sink bridge), the main runloop (watchdog,
+    // bootstrap), or any future producer. The check-and-emit MUST be atomic
+    // with respect to the per-stream hostTime sequence — otherwise two
+    // producers can race past each other and stream.send() receives a
+    // non-monotonic pair, which CMIO consumers (QuickTime/Zoom/etc.) handle
+    // by freezing. `sendLock` covers both the hostTime clamp and the call
+    // to `stream.send` so a real frame can't slip between the watchdog's
+    // check and emit.
     func sendSampleBuffer(_ sampleBuffer: CMSampleBuffer, isDefault: Bool = false) {
         if stream == nil {
             logger.error("stream is nil - cannot send frame")
@@ -463,17 +520,29 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
             }
         }
 
-        let hostTimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+
+        os_unfair_lock_lock(&sendLock)
+        // Clamp to strictly-increasing. Bump by 1 ns rather than dropping;
+        // ns-level jitter is imperceptible to video and a dropped frame is
+        // worse than a 1 ns nudge. See MonotonicHostClock for tested logic.
+        let hostTimeNs: UInt64
+        if nowNs <= lastSentHostTimeNs {
+            hostTimeNs = lastSentHostTimeNs &+ 1
+        } else {
+            hostTimeNs = nowNs
+        }
+        lastSentHostTimeNs = hostTimeNs
+        if !isDefault {
+            lastRealFrameUptimeNs = hostTimeNs
+        }
 
         stream.send(
             sampleBuffer,
             discontinuity: [],
             hostTimeInNanoseconds: hostTimeNs
         )
-
-        if !isDefault {
-            lastRealFrameUptimeNs = hostTimeNs
-        }
+        os_unfair_lock_unlock(&sendLock)
     }
     
     private func createDefaultPixelBuffer() {
@@ -543,9 +612,17 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self = self else { return }
+            // Read `lastRealFrameUptimeNs` under the same lock that
+            // sendSampleBuffer writes it. Without this, a real frame can
+            // land between the read and the sendDefaultFrame call below
+            // — and stream.send sees two emits with the same logical time
+            // window, freezing the consumer.
+            os_unfair_lock_lock(&self.sendLock)
             let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             let last = self.lastRealFrameUptimeNs
-            if last == 0 || now - last > Self.noFrameTimeoutNs {
+            let isStale = (last == 0) || (now - last > Self.noFrameTimeoutNs)
+            os_unfair_lock_unlock(&self.sendLock)
+            if isStale {
                 self.sendDefaultFrame()
             }
         }
@@ -560,10 +637,18 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
         guard let _ = device.source as? GigEVirtualCameraExtensionDeviceSource else { return }
         guard let buffer = defaultPixelBuffer else { return }
 
+        // Use CLOCK_UPTIME_RAW for PTS so the watchdog frames are in the same
+        // clock domain as real frames (sendSampleBuffer also uses CLOCK_UPTIME_RAW
+        // for hostTimeInNanoseconds). On Apple Silicon these match the host-time
+        // clock used previously, but the prior CMClockGetHostTimeClock() reading
+        // is a different code path that can drift across macOS versions; using
+        // one source removes the failure mode entirely.
+        let ptsNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         var sampleBuffer: CMSampleBuffer?
         var timingInfo = CMSampleTimingInfo(
             duration: frameDuration,
-            presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+            presentationTimeStamp: CMTimeMake(value: Int64(bitPattern: ptsNs),
+                                              timescale: 1_000_000_000),
             decodeTimeStamp: .invalid
         )
 
@@ -602,11 +687,39 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
     // Stream management
     private var sourceStreamSource: SourceStreamSource!
     private var sinkStreamSource: SinkStreamSource!
-    
-    // Stream state
-    var streamingCounter = 0  // Number of clients connected to source
-    private(set) var isSinking = false  // Whether sink is active
-    
+
+    // Stream state. CMIO can invoke startStream/stopStream on any thread, and
+    // the source-stream and sink-stream lifecycles can interleave (consumer
+    // connects while app is in the middle of attaching its sink, etc.). The
+    // "first-client" and "last-client" branches below relied on bare reads of
+    // these counters, which produced stale-state windows where the extension
+    // either over-signaled the app (multiple signalNeedFrames calls per
+    // consumer) or under-signaled (consumer fully attached without the app
+    // ever being woken). All mutations and decisions happen under stateLock.
+    private var _streamingCounter = 0
+    private var _isSinking = false
+    private var stateLock = os_unfair_lock()
+
+    /// Thread-safe snapshot for logging. Not for control flow — by the time
+    /// the caller acts on the return value it may already be stale.
+    func snapshotState() -> (counter: Int, isSinking: Bool) {
+        os_unfair_lock_lock(&stateLock)
+        defer { os_unfair_lock_unlock(&stateLock) }
+        return (_streamingCounter, _isSinking)
+    }
+
+    var isSinking: Bool {
+        os_unfair_lock_lock(&stateLock)
+        defer { os_unfair_lock_unlock(&stateLock) }
+        return _isSinking
+    }
+
+    var streamingCounter: Int {
+        os_unfair_lock_lock(&stateLock)
+        defer { os_unfair_lock_unlock(&stateLock) }
+        return _streamingCounter
+    }
+
     // App coordination
     private let streamStateCoordinator = StreamStateCoordinator()
     
@@ -711,74 +824,77 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
     
     // Called by source stream when client starts watching
     func startStreaming() {
-        streamingCounter += 1
-        NSLog("🎬🎬🎬 DeviceSource.startStreaming() called - counter: \(self.streamingCounter)")
-        logger.info("🎬 Source stream started. Client count: \(self.streamingCounter)")
-        logger.info("Sink active: \(self.isSinking)")
-        
-        // If this is the first client and sink isn't active, signal app
-        if streamingCounter == 1 && !isSinking {
+        // Decide whether we are the first client and whether the sink is
+        // already serving frames — atomically, so a concurrent consumer
+        // attach/detach can't make us double-signal or skip signaling.
+        os_unfair_lock_lock(&stateLock)
+        _streamingCounter += 1
+        let counter = _streamingCounter
+        let sinking = _isSinking
+        let shouldSignalNeedFrames = (counter == 1) && !sinking
+        os_unfair_lock_unlock(&stateLock)
+
+        logger.info("🎬 Source stream started. Client count: \(counter), sink: \(sinking)")
+
+        // Notify outside the lock — signalNeedFrames touches UserDefaults
+        // and shouldn't hold the lock across an IPC-style write.
+        if shouldSignalNeedFrames {
             logger.info("📢 Signaling app to start sending frames")
             streamStateCoordinator.signalNeedFrames()
-        } else if streamingCounter == 1 && isSinking {
+        } else if counter == 1 && sinking {
             logger.info("✅ Sink already active - frames should be flowing")
-            NSLog("✅✅✅ Sink already active - frames should start flowing to source")
         }
     }
-    
+
     // Called by source stream when client stops watching
     func stopStreaming() {
-        if streamingCounter > 0 {
-            streamingCounter -= 1
+        os_unfair_lock_lock(&stateLock)
+        if _streamingCounter > 0 {
+            _streamingCounter -= 1
         }
-        
-        logger.info("Source stream stopped. Client count: \(self.streamingCounter)")
-        
-        // If no more clients, signal app to stop
-        if streamingCounter == 0 {
+        let counter = _streamingCounter
+        let shouldSignalStopped = (counter == 0)
+        os_unfair_lock_unlock(&stateLock)
+
+        logger.info("Source stream stopped. Client count: \(counter)")
+
+        if shouldSignalStopped {
             streamStateCoordinator.signalStreamStopped()
         }
     }
-    
+
     // Called by sink stream when app starts sending
     func startSinkStreaming() {
-        logger.info("🎯 Starting sink streaming - setting up bridge to source")
-        logger.info("Current streaming counter: \(self.streamingCounter)")
-        isSinking = true
-        
-        // Set up the bridge: route buffers from sink to source
+        os_unfair_lock_lock(&stateLock)
+        _isSinking = true
+        let counter = _streamingCounter
+        os_unfair_lock_unlock(&stateLock)
+
+        logger.info("🎯 Starting sink streaming - setting up bridge to source (clients: \(counter))")
+
+        // Set up the bridge: route buffers from sink to source. We deliberately
+        // do NOT take stateLock inside the hot frame path; sendSampleBuffer has
+        // its own lock, and a stale `streamingCounter` here is at worst a log
+        // line — frames are still forwarded to the source stream regardless.
         sinkStreamSource.consumeSampleBuffer = { [weak self] buffer in
-            guard let self = self else { 
-                self?.logger.error("DeviceSource deallocated - cannot forward frame")
-                return 
-            }
-            
-            self.logger.debug("🔄 DeviceSource received frame from sink")
-            
-            // Always forward frames to source stream when sink is active
-            // The source stream will handle client management
-            self.logger.info("📤 Forwarding frame to source (clients: \(self.streamingCounter))")
-            NSLog("🚀🚀🚀 Sending frame to source stream - clients: \(self.streamingCounter)")
-            
-            // Check if sourceStreamSource is nil
-            if self.sourceStreamSource == nil {
-                NSLog("❌❌❌ sourceStreamSource is NIL!")
+            guard let self = self else { return }
+            guard self.sourceStreamSource != nil else {
                 self.logger.error("sourceStreamSource is nil - cannot forward frame")
                 return
             }
-            
-            NSLog("🚀🚀🚀 sourceStreamSource exists, calling sendSampleBuffer...")
             self.sourceStreamSource.sendSampleBuffer(buffer)
-            NSLog("🚀🚀🚀 sendSampleBuffer call completed")
         }
-        
+
         logger.info("✅ Sink-to-source bridge configured")
     }
-    
+
     // Called by sink stream when app stops sending
     func stopSinkStreaming() {
+        os_unfair_lock_lock(&stateLock)
+        _isSinking = false
+        os_unfair_lock_unlock(&stateLock)
+
         logger.info("Stopping sink streaming")
-        isSinking = false
         sinkStreamSource.consumeSampleBuffer = nil
     }
 }

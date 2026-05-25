@@ -230,27 +230,43 @@ class CMIOSinkConnector {
     }
     
     // MARK: - Public Interface
-    
+
     func connect() -> Bool {
         logger.info("Connect called - waiting for sink stream discovery via property listener...")
-        
-        // The actual connection will happen automatically when the sink stream is discovered
-        // via the property listener callback. This method now just ensures the listener is active.
-        
+
         if propertyListener == nil {
             setupPropertyListener()
         }
-        
+
         // If we already have a discovered sink stream, connect to it
         if let streamID = sinkStreamID, let deviceID = deviceID {
             return connectToSinkStream(streamID: streamID, deviceID: deviceID)
         }
-        
-        // Otherwise, connection will happen automatically when sink is discovered
-        logger.info("Waiting for sink stream to be discovered...")
+
+        // We don't have IDs yet. The property listener has been registered,
+        // but it only fires on CMIO change notifications — if the sink stream
+        // is already registered with the OS and unchanged since we missed the
+        // initial event, the listener will sit silent forever. Re-run manual
+        // discovery so a stall-recovery / user-initiated retry isn't a no-op.
+        logger.info("No cached sink IDs; running manual CMIO discovery as fallback")
+        tryManualDiscovery()
         return false
     }
-    
+
+    /// Public-facing forced rediscovery. Used by the stall watchdog and the
+    /// "Retry CMIO Sink" button. Bypasses any cached state — it asks CMIO for
+    /// the current device list and tries to attach if our sink stream is
+    /// present. Without this, the listener-only path was a dead end: after
+    /// `handleDisconnection` cleared the IDs, nothing re-fetched them and the
+    /// app waited forever for a property-changed callback that never came.
+    func forceRediscovery() {
+        logger.info("Forced rediscovery requested")
+        if propertyListener == nil {
+            setupPropertyListener()
+        }
+        tryManualDiscovery()
+    }
+
     func disconnect() {
         handleDisconnection()
     }

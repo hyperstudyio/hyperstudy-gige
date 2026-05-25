@@ -258,20 +258,18 @@ class CameraManager: NSObject, ObservableObject {
         } else {
             print("CameraManager: Not connected, triggering camera discovery...")
             isConnected = false
-            
+
             // Try to discover cameras
             gigEManager.discoverCameras()
-            
+
             // Don't auto-reconnect - let user manually select camera
         }
-        
-        // Listen for camera list updates
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleCameraListUpdate),
-            name: NSNotification.Name("GigECamerasDiscovered"),
-            object: nil
-        )
+
+        // NOTE: the `GigECamerasDiscovered` observer is registered once in
+        // setupNotifications(). Registering here would leak a new observer
+        // every time checkCameraConnection runs (every network change),
+        // which produced the "Camera list updated: N cameras found" duplicate
+        // explosion seen in diagnostics (8 → 17 fanout over a single session).
     }
     
     private func connectToCamera(withId cameraId: String) {
@@ -425,6 +423,17 @@ class CameraManager: NSObject, ObservableObject {
     }
     
     private func setupNotifications() {
+        // Listen for camera list updates (was previously registered in
+        // checkCameraConnection, which gets called on every network change.
+        // That leaked a new observer every iteration, causing N-fold log
+        // amplification and progressively worse main-thread load.)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleCameraListUpdate),
+            name: NSNotification.Name("GigECamerasDiscovered"),
+            object: nil
+        )
+
         // Listen for camera connection notifications from extension
         NotificationCenter.default.addObserver(
             self,
@@ -673,12 +682,14 @@ class CameraManager: NSObject, ObservableObject {
     // MARK: - Public Methods for Frame Sender
     func retryFrameSenderConnection() {
         logger.info("Retrying CMIO sink connection...")
-        
-        // With property listeners, we just need to restart the listener
+
+        // Drop the current handle and force a rediscovery. The previous
+        // implementation only waited for a property-changed callback that,
+        // in the dead-sink case, never fires — the user could click Retry
+        // forever with no effect. forceRediscovery enumerates CMIO devices
+        // synchronously and reattaches if our sink is present.
         sinkConnector.disconnect()
-        
-        // The property listener will automatically detect and connect when sink stream is available
-        logger.info("Property listener will automatically reconnect when sink stream is available")
+        sinkConnector.forceRediscovery()
     }
     
     func testSinkStreamConnection() {  // Keep method name for compatibility
@@ -937,9 +948,15 @@ class CameraManager: NSObject, ObservableObject {
     }
 
     private func attemptStreamStallRecovery() {
-        logger.warning("Attempting one-shot stream-stall recovery: sink disconnect/reconnect")
+        logger.warning("Attempting one-shot stream-stall recovery: sink disconnect + forced rediscovery")
+        // disconnect() nils the cached sink IDs, then forceRediscovery()
+        // enumerates CMIO devices and reattaches if our sink is registered.
+        // The previous connect()-only call was a no-op in the most common
+        // failure mode — once IDs were cleared, only a CMIO property-changed
+        // callback could re-populate them, and that callback doesn't fire
+        // when the OS still considers the sink stream registered.
         sinkConnector.disconnect()
-        _ = sinkConnector.connect()
+        sinkConnector.forceRediscovery()
     }
     
     func getPerformanceMetrics() -> (fps: Double, framesTotal: UInt64, framesDropped: UInt64) {
@@ -1022,9 +1039,18 @@ class CameraManager: NSObject, ObservableObject {
             return
         }
         let gigEManager = GigECameraManager.shared
-        gigEManager.setExposureTime(exposureTime)
-        logger.info("Updated exposure time to \(self.exposureTime) µs")
-        
+        // Defense-in-depth clamp. AravisBridge.setExposureTime also clamps
+        // *if* its bounds query succeeds, but its else-branch falls through
+        // unclamped. Doing it here against our cached declared bounds means
+        // we never send a value the camera is going to choke on, regardless
+        // of what Aravis returns for bounds at write time.
+        let clamped = min(max(exposureTime, exposureTimeMin), exposureTimeMax)
+        if clamped != exposureTime {
+            logger.warning("Clamping exposure write \(self.exposureTime) µs to \(clamped) µs (range \(self.exposureTimeMin)–\(self.exposureTimeMax))")
+        }
+        gigEManager.setExposureTime(clamped)
+        logger.info("Updated exposure time to \(clamped) µs")
+
         // Verify the change was applied
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             if let actualExposure = gigEManager.getExposureTime() {
@@ -1032,16 +1058,20 @@ class CameraManager: NSObject, ObservableObject {
             }
         }
     }
-    
+
     private func updateGain() {
         guard isConnected else {
             logger.warning("Cannot update gain - not connected")
             return
         }
         let gigEManager = GigECameraManager.shared
-        gigEManager.setGain(gain)
-        logger.info("Updated gain to \(self.gain)")
-        
+        let clamped = min(max(gain, gainMin), gainMax)
+        if clamped != gain {
+            logger.warning("Clamping gain write \(self.gain) to \(clamped) (range \(self.gainMin)–\(self.gainMax))")
+        }
+        gigEManager.setGain(clamped)
+        logger.info("Updated gain to \(clamped)")
+
         // Verify the change was applied
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             if let actualGain = gigEManager.getGain() {
@@ -1049,15 +1079,19 @@ class CameraManager: NSObject, ObservableObject {
             }
         }
     }
-    
+
     private func updateFrameRate() {
         guard isConnected else {
             logger.warning("Cannot update frame rate - not connected")
             return
         }
         let gigEManager = GigECameraManager.shared
-        gigEManager.setFrameRate(frameRate)
-        logger.info("Updated frame rate to \(self.frameRate) fps")
+        let clamped = min(max(frameRate, frameRateMin), frameRateMax)
+        if clamped != frameRate {
+            logger.warning("Clamping frame rate write \(self.frameRate) fps to \(clamped) fps (range \(self.frameRateMin)–\(self.frameRateMax))")
+        }
+        gigEManager.setFrameRate(clamped)
+        logger.info("Updated frame rate to \(clamped) fps")
         
         // Verify the change was applied
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
@@ -1124,29 +1158,53 @@ class CameraManager: NSObject, ObservableObject {
             }
         }
         
-        // Get current values from camera only if we haven't set them yet
-        // This prevents overriding user's manual settings
+        // Get current values from camera, but only if they are within the
+        // declared bounds. Some cameras (notably the GVRD-MRC MR-CAM-HR after
+        // a reconnect cycle) return 0 from `arv_camera_get_exposure_time`
+        // even though their declared minimum is 10 µs. Without this guard,
+        // we would propagate 0 into `self.exposureTime`, the didSet would
+        // then write 0 back to the camera, and the camera would enter the
+        // "controls not available" state we saw in the failing diagnostics.
+        // If the camera reports out-of-range, push our current app value
+        // back to it (clamped at the AravisBridge layer) so the user's
+        // intended setting survives the reconnect.
         if self.exposureTimeAvailable, let currentExposure = gigEManager.getExposureTime() {
-            // Only update if significantly different (avoid floating point issues)
-            if abs(self.exposureTime - currentExposure) > 1.0 {
-                self.exposureTime = currentExposure
-                logger.info("Loaded exposure from camera: \(currentExposure) µs")
+            let inRange = currentExposure >= self.exposureTimeMin
+                       && currentExposure <= self.exposureTimeMax
+            if inRange {
+                if abs(self.exposureTime - currentExposure) > 1.0 {
+                    self.exposureTime = currentExposure
+                    logger.info("Loaded exposure from camera: \(currentExposure) µs")
+                }
+            } else {
+                logger.warning("Camera reported out-of-range exposure \(currentExposure) µs (valid range \(self.exposureTimeMin)–\(self.exposureTimeMax)); restoring app value \(self.exposureTime) µs")
+                updateExposureTime()  // push our value to the camera
             }
         }
-        
+
         if self.gainAvailable, let currentGain = gigEManager.getGain() {
-            // Only update if significantly different
-            if abs(self.gain - currentGain) > 0.01 {
-                self.gain = currentGain
-                logger.info("Loaded gain from camera: \(currentGain)")
+            let inRange = currentGain >= self.gainMin && currentGain <= self.gainMax
+            if inRange {
+                if abs(self.gain - currentGain) > 0.01 {
+                    self.gain = currentGain
+                    logger.info("Loaded gain from camera: \(currentGain)")
+                }
+            } else {
+                logger.warning("Camera reported out-of-range gain \(currentGain) (valid range \(self.gainMin)–\(self.gainMax)); restoring app value \(self.gain)")
+                updateGain()
             }
         }
-        
+
         if self.frameRateAvailable, let currentFPS = gigEManager.getFrameRate() {
-            // Only update if significantly different
-            if abs(self.frameRate - currentFPS) > 0.1 {
-                self.frameRate = currentFPS
-                logger.info("Loaded frame rate from camera: \(currentFPS) fps")
+            let inRange = currentFPS >= self.frameRateMin && currentFPS <= self.frameRateMax
+            if inRange {
+                if abs(self.frameRate - currentFPS) > 0.1 {
+                    self.frameRate = currentFPS
+                    logger.info("Loaded frame rate from camera: \(currentFPS) fps")
+                }
+            } else {
+                logger.warning("Camera reported out-of-range frame rate \(currentFPS) fps (valid range \(self.frameRateMin)–\(self.frameRateMax)); restoring app value \(self.frameRate) fps")
+                updateFrameRate()
             }
         }
         

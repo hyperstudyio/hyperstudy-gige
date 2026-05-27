@@ -16,9 +16,11 @@ private let logger = Logger(subsystem: "com.lukechang.GigEVirtualCamera.Extensio
 
 // Debug: Write immediately when extension starts
 NSLog("🔴 GigEVirtualCamera Extension: main.swift starting...")
+SharedExtensionLog.shared.write(level: .notice, category: "Ext.Main",
+                                message: "Extension main.swift starting")
 if let defaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera") {
     defaults.set("Extension main.swift started at \(Date())", forKey: "Debug_MainStarted")
-    
+
     // Clear any stale IOSurface IDs
     defaults.removeObject(forKey: "IOSurfaceIDs")
     defaults.synchronize()
@@ -33,6 +35,8 @@ do {
     let providerSource = GigEVirtualCameraExtensionProviderSource()
     fputs("🔴 GigEVirtualCamera Extension: Provider created successfully\n", stderr)
     NSLog("🔴 GigEVirtualCamera Extension: Provider created successfully")
+    SharedExtensionLog.shared.write(level: .info, category: "Ext.Main",
+                                    message: "Provider created; starting CMIO service")
 
 // Debug: Write after provider created
 if let defaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera") {
@@ -50,4 +54,6 @@ if let defaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVi
 } catch {
     fputs("🔴 GigEVirtualCamera Extension: ERROR creating provider: \(error)\n", stderr)
     NSLog("🔴 GigEVirtualCamera Extension: ERROR creating provider: \(error)")
+    SharedExtensionLog.shared.write(level: .error, category: "Ext.Main",
+                                    message: "ERROR creating provider: \(error)")
 }

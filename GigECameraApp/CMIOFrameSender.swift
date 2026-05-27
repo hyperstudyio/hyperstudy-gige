@@ -83,6 +83,15 @@ class CMIOSinkConnector {
     // State
     private var isConnected = false
     private var frameCount: UInt64 = 0
+    /// Wall-clock time of the most recent "Cannot send frame" warning. Used to
+    /// rate-limit the disconnected-state log to at most once per second. The
+    /// previous gate (`frameCount % 30 == 0`) keyed on `frameCount`, which only
+    /// increments on SUCCESS — so a long disconnected stretch with no successes
+    /// either logged every failed attempt (when frameCount was 0 or any multiple
+    /// of 30) or none at all. At 250 fps that filled the 1000-entry diagnostics
+    /// buffer in under 4 seconds and evicted every other log line, making the
+    /// initial connection sequence impossible to retrace from a diagnostic export.
+    private var lastNotConnectedLogTime: TimeInterval = 0
 
     // Mach-uptime ns of last successful CMSimpleQueueEnqueue. Read by the
     // stream-stall watchdog in CameraManager. Protected by `livenessLock`.
@@ -376,7 +385,12 @@ class CMIOSinkConnector {
     @discardableResult
     func sendFrame(_ pixelBuffer: CVPixelBuffer, timestamp: FrameTimestamp) -> Bool {
         guard isConnected, let queue = sinkQueue else {
-            if frameCount % 30 == 0 {
+            // Time-based throttle: at most one warning per second regardless of
+            // frame rate. The race on `lastNotConnectedLogTime` is benign —
+            // worst case is a duplicate log every now and then.
+            let now = Date().timeIntervalSince1970
+            if now - lastNotConnectedLogTime >= 1.0 {
+                lastNotConnectedLogTime = now
                 logger.warning("Cannot send frame - not connected to sink")
             }
             return false

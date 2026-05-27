@@ -35,6 +35,8 @@ class StreamStateCoordinator {
     func signalNeedFrames() {
         guard let defaults = groupDefaults else {
             logger.error("Failed to access App Group UserDefaults")
+            SharedExtensionLog.shared.write(level: .error, category: "Ext.StreamState",
+                message: "Failed to access App Group UserDefaults in signalNeedFrames")
             return
         }
         let existing = defaults.dictionary(forKey: Self.stateKey) ?? [:]
@@ -46,6 +48,8 @@ class StreamStateCoordinator {
         defaults.synchronize()
 
         logger.info("Signaled app to start sending frames")
+        SharedExtensionLog.shared.write(level: .notice, category: "Ext.StreamState",
+            message: "Wrote streamActive=true to app group; awaiting app sink attach")
     }
 
     /// Clears the active flag but preserves `newClientConnected` and other
@@ -124,6 +128,8 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
         // Store the client reference
         self.client = client
         logger.info("Client authorized to start sink stream: PID \(client.pid)")
+        SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
+            message: "Client authorized to start sink stream (PID \(client.pid))")
         return true
     }
     
@@ -141,10 +147,12 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
         NSLog("🟢🟢🟢 SINK STREAM STARTING - Client PID: \(self.client?.pid ?? 0)")
         logger.info("🟢 Starting sink stream")
         logger.info("Client info - PID: \(self.client?.pid ?? 0)")
-        
+        SharedExtensionLog.shared.write(level: .notice, category: "Ext.SinkStream",
+            message: "🟢 Starting sink stream (client PID \(self.client?.pid ?? 0))")
+
         // Notify device source that sink is starting
         deviceSource.startSinkStreaming()
-        
+
         // Begin consuming buffers
         logger.info("Beginning buffer consumption...")
         NSLog("🟢🟢🟢 Beginning sink buffer consumption...")
@@ -157,6 +165,8 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
         }
 
         logger.info("Stopping sink stream")
+        SharedExtensionLog.shared.write(level: .notice, category: "Ext.SinkStream",
+            message: "Stopping sink stream")
 
         // Stop subscribing via the lock-protected setter so the consumer
         // queue's next tick observes the change.
@@ -204,17 +214,23 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
     private func subscribe() throws {
         guard let client = self.client else {
             logger.error("No client available for subscription")
+            SharedExtensionLog.shared.write(level: .error, category: "Ext.SinkStream",
+                message: "subscribe() called but no client is available")
             return
         }
 
         let wasSubscribing = setSubscribing(true)
         guard !wasSubscribing else {
             logger.warning("Already subscribing - skipping duplicate subscription")
+            SharedExtensionLog.shared.write(level: .warning, category: "Ext.SinkStream",
+                message: "Already subscribing - skipping duplicate subscription")
             return
         }
         consecutiveErrorCount = 0
 
         logger.info("🔵 Sink subscribing to consume buffers from client PID: \(client.pid)")
+        SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
+            message: "🔵 Sink subscribing to consume buffers (client PID \(client.pid))")
 
         // Start consuming buffers - this will be called repeatedly by CMIO
         scheduleConsumeNextBuffer(after: 0)
@@ -245,6 +261,13 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                 self.consecutiveErrorCount &+= 1
                 let count = self.consecutiveErrorCount
                 self.logger.error("❌ Error consuming sample buffer (#\(count)): \(error.localizedDescription)")
+                // Log every 1st/4th/8th error to the shared log (the full
+                // burst is in the unified log via os.log already); the
+                // shared log surfaces the cadence to the diagnostics drawer.
+                if count == 1 || count == 4 || count >= Self.maxConsecutiveErrors {
+                    SharedExtensionLog.shared.write(level: .error, category: "Ext.SinkStream",
+                        message: "❌ consumeSampleBuffer error #\(count): \(error.localizedDescription)")
+                }
 
                 if count >= Self.maxConsecutiveErrors {
                     // The client connection is dead. Tear down the subscription
@@ -252,6 +275,8 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                     // the app's sink handle finally closes, or a fresh
                     // startStream will reset everything.
                     self.logger.error("Giving up after \(count) consecutive errors; stopping consumption")
+                    SharedExtensionLog.shared.write(level: .error, category: "Ext.SinkStream",
+                        message: "Giving up after \(count) consecutive errors; subscription torn down")
                     _ = self.setSubscribing(false)
                     return
                 }
@@ -271,6 +296,8 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                         groupDefaults.set("First frame received at \(Date())", forKey: "Debug_FirstFrameReceived")
                         groupDefaults.synchronize()
                     }
+                    SharedExtensionLog.shared.write(level: .notice, category: "Ext.SinkStream",
+                        message: "🎉 First frame consumed from sink (seq 0)")
                 }
 
                 if sequenceNumber % 300 == 0 {
@@ -278,6 +305,10 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                     // costing ~150 calls/s at 30 fps. Sample once every 10
                     // seconds instead.
                     self.logger.info("Sink received frame #\(sequenceNumber)")
+                    if sequenceNumber > 0 {
+                        SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
+                            message: "Sink consumed frame #\(sequenceNumber)")
+                    }
                 }
 
                 if let consumeCallback = self.consumeSampleBuffer {
@@ -402,6 +433,8 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
     func authorizedToStartStream(for client: CMIOExtensionClient) -> Bool {
         logger.info("Client authorized to start source stream: PID \(client.pid)")
         NSLog("🎬🎬🎬 SOURCE: authorizedToStartStream called - Client PID: \(client.pid)")
+        SharedExtensionLog.shared.write(level: .info, category: "Ext.SourceStream",
+            message: "Client authorized to start source stream (PID \(client.pid))")
         
         // Option 3: Start sending frames immediately upon authorization
         guard let deviceSource = device.source as? GigEVirtualCameraExtensionDeviceSource else {
@@ -445,7 +478,9 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
         NSLog("🎬🎬🎬 Current streamingCounter BEFORE increment: \(deviceSource.streamingCounter)")
         logger.info("🟢 Starting source stream")
         logger.info("Device sink active: \(deviceSource.isSinking)")
-        
+        SharedExtensionLog.shared.write(level: .notice, category: "Ext.SourceStream",
+            message: "🟢 Starting source stream (sink active: \(deviceSource.isSinking))")
+
         // Notify device source
         deviceSource.startStreaming()
 
@@ -481,8 +516,10 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
         guard let deviceSource = device.source as? GigEVirtualCameraExtensionDeviceSource else {
             throw NSError(domain: "GigEVirtualCamera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid device source"])
         }
-        
+
         logger.info("Stopping source stream")
+        SharedExtensionLog.shared.write(level: .notice, category: "Ext.SourceStream",
+            message: "Stopping source stream")
 
         // Stop watchdog
         stopNoFrameWatchdog()
@@ -671,6 +708,11 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
 
         if let sample = sampleBuffer {
             logger.info("Watchdog emitting default frame -- no real frame in last 2s")
+            // This is one of the most important diagnostic signals: when the
+            // app side has stopped delivering, the extension falls back to a
+            // test pattern. Repeated firings = ongoing stall.
+            SharedExtensionLog.shared.write(level: .warning, category: "Ext.SourceStream",
+                message: "⚠️ no-frame watchdog: emitting default frame (no real frame in last 2s)")
             sendSampleBuffer(sample, isDefault: true)
         }
     }
@@ -835,14 +877,20 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
         os_unfair_lock_unlock(&stateLock)
 
         logger.info("🎬 Source stream started. Client count: \(counter), sink: \(sinking)")
+        SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
+            message: "🎬 Source stream started (clients: \(counter), sink active: \(sinking))")
 
         // Notify outside the lock — signalNeedFrames touches UserDefaults
         // and shouldn't hold the lock across an IPC-style write.
         if shouldSignalNeedFrames {
             logger.info("📢 Signaling app to start sending frames")
+            SharedExtensionLog.shared.write(level: .notice, category: "Ext.Device",
+                message: "📢 Signaling app to start sending frames (newClientConnected=true)")
             streamStateCoordinator.signalNeedFrames()
         } else if counter == 1 && sinking {
             logger.info("✅ Sink already active - frames should be flowing")
+            SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
+                message: "✅ Sink already active - frames should be flowing")
         }
     }
 
@@ -857,8 +905,12 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
         os_unfair_lock_unlock(&stateLock)
 
         logger.info("Source stream stopped. Client count: \(counter)")
+        SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
+            message: "Source stream stopped (clients remaining: \(counter))")
 
         if shouldSignalStopped {
+            SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
+                message: "Signaling app: streamActive=false (last client gone)")
             streamStateCoordinator.signalStreamStopped()
         }
     }
@@ -871,6 +923,8 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
         os_unfair_lock_unlock(&stateLock)
 
         logger.info("🎯 Starting sink streaming - setting up bridge to source (clients: \(counter))")
+        SharedExtensionLog.shared.write(level: .notice, category: "Ext.Device",
+            message: "🎯 Starting sink streaming - bridge to source attached (clients: \(counter))")
 
         // Set up the bridge: route buffers from sink to source. We deliberately
         // do NOT take stateLock inside the hot frame path; sendSampleBuffer has
@@ -895,6 +949,8 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
         os_unfair_lock_unlock(&stateLock)
 
         logger.info("Stopping sink streaming")
+        SharedExtensionLog.shared.write(level: .notice, category: "Ext.Device",
+            message: "Stopping sink streaming - bridge detached")
         sinkStreamSource.consumeSampleBuffer = nil
     }
 }
@@ -925,10 +981,14 @@ class GigEVirtualCameraExtensionProviderSource: NSObject, CMIOExtensionProviderS
     
     func connect(to client: CMIOExtensionClient) throws {
         logger.info("Client connected: PID \(client.pid)")
+        SharedExtensionLog.shared.write(level: .info, category: "Ext.Provider",
+            message: "Client connected (PID \(client.pid))")
     }
-    
+
     func disconnect(from client: CMIOExtensionClient) {
         logger.info("Client disconnected: PID \(client.pid)")
+        SharedExtensionLog.shared.write(level: .info, category: "Ext.Provider",
+            message: "Client disconnected (PID \(client.pid))")
     }
     
     var availableProperties: Set<CMIOExtensionProperty> {

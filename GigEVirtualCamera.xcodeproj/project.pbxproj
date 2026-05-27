@@ -25,6 +25,8 @@
 		D3A632A863EE95A66CD83039 /* CMIOFrameSender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43D9C615FB22B5ADC5572BA6 /* CMIOFrameSender.swift */; };
 		DF218341570648066EE4D859 /* CameraManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08987548898558EC7975B0D2 /* CameraManager.swift */; };
 		E30049982FBD70CD00C349F1 /* FramePipelineKit in Frameworks */ = {isa = PBXBuildFile; productRef = E30049972FBD70CD00C349F1 /* FramePipelineKit */; };
+		E3BED8E02FC7376B00915286 /* SharedExtensionLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3BED8DF2FC7376A00915286 /* SharedExtensionLog.swift */; };
+		E3BED8E12FC7376B00915286 /* SharedExtensionLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3BED8DF2FC7376A00915286 /* SharedExtensionLog.swift */; };
 		E9261B5C4B76BFF0975319CE /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 287F86C390310B151C81E5F0 /* DesignSystem.swift */; };
 		FC594C358FDF42D7C703E7C7 /* ExtensionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 272BC57E4EC81F46F8984161 /* ExtensionManager.swift */; };
 		FF2ED4EAB332C4A9E072E621 /* PixelBufferConverter.swift in Sources */ = {isa = PBXBuildFile; fileRef = D69EA7B08E39383581459407 /* PixelBufferConverter.swift */; };
@@ -82,6 +84,7 @@
 		D69EA7B08E39383581459407 /* PixelBufferConverter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PixelBufferConverter.swift; sourceTree = "<group>"; };
 		DA0D776346DD1FED961B677F /* GigECameraManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GigECameraManager.swift; sourceTree = "<group>"; };
 		E213BC7702662D7BD1E43B14 /* GigEVirtualCamera-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "GigEVirtualCamera-Bridging-Header.h"; sourceTree = "<group>"; };
+		E3BED8DF2FC7376A00915286 /* SharedExtensionLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedExtensionLog.swift; sourceTree = "<group>"; };
 		FE1E7B53D0144A617847482B /* GigECamera.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = GigECamera.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -160,6 +163,7 @@
 			isa = PBXGroup;
 			children = (
 				9BED1F750517D3B532E43A04 /* PixelBufferHelpers.swift */,
+				E3BED8DF2FC7376A00915286 /* SharedExtensionLog.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -347,6 +351,7 @@
 				7FB68897794C86621A4AE2B3 /* CMIOExtensionProperties.swift in Sources */,
 				40EF9AB3E39578D69B0C5FA2 /* GigEVirtualCameraExtensionProvider.swift in Sources */,
 				21250C9C21F9B91EE64A0516 /* PixelBufferHelpers.swift in Sources */,
+				E3BED8E02FC7376B00915286 /* SharedExtensionLog.swift in Sources */,
 				2781A12609151AB8FAF537C5 /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -358,6 +363,7 @@
 				9E7E34ED3E312F662001A0DB /* AravisBridge.mm in Sources */,
 				D3A632A863EE95A66CD83039 /* CMIOFrameSender.swift in Sources */,
 				33458ADE303266E36DE5CBE8 /* CMIOPropertyListener.swift in Sources */,
+				E3BED8E12FC7376B00915286 /* SharedExtensionLog.swift in Sources */,
 				60AB199939003528FBAC0F1D /* CameraConstants.swift in Sources */,
 				DF218341570648066EE4D859 /* CameraManager.swift in Sources */,
 				91AC552492FCCD5F93B1787C /* ContentView.swift in Sources */,

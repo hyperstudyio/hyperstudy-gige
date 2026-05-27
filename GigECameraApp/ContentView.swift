@@ -947,12 +947,12 @@ struct DiagnosticsDrawer: View {
                 .toggleStyle(.switch)
 
                 // Scope disclosure: OSLogStore(.currentProcessIdentifier) only
-                // returns this process's log entries. The Camera Extension is
-                // a separate process and its log isn't captured here. The
-                // state-snapshot section of the export DOES reflect extension
-                // health (sink connected, stream stalled, PTS nudges) via the
-                // app/extension shared state, so reports remain triageable.
-                Text("Captures this app only — Camera Extension runs in a separate process and its log isn't included. The state snapshot section of the export still reflects extension health.")
+                // returns this process's log entries — but we also tail the
+                // Camera Extension's shared-log file in the app group
+                // container, so events from both processes are surfaced here.
+                // Extension entries are tagged with categories prefixed "Ext."
+                // (e.g. Ext.SinkStream, Ext.SourceStream) for visual distinction.
+                Text("Includes this app and Camera Extension (categories prefixed “Ext.”). Extension entries are written to a shared log file in the app group container.")
                     .font(DesignSystem.Typography.caption)
                     .foregroundColor(DesignSystem.Colors.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)

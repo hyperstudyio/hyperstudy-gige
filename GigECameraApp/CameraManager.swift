@@ -1280,6 +1280,12 @@ final class DiagnosticsLog: ObservableObject {
     // same stale cursor and produce duplicate entries, and so `clear()` can
     // serialize against any in-flight fetch.
     private var cursorDate: Date = .distantPast
+    /// Separate cursor for the extension's shared-log file. The CMIO extension
+    /// runs in a different process, so its `Logger()` calls don't appear in
+    /// this app's OSLogStore. Instead it appends JSONL records to a file in
+    /// the app group container; we tail that file alongside the in-process
+    /// OSLog reads so the drawer shows both sides of the pipeline.
+    private var extensionLogCursor = SharedExtensionLog.Cursor()
     private let pollQueue = DispatchQueue(label: "com.lukechang.diagnosticsLog.poll", qos: .utility)
     private let logger = Logger(subsystem: CameraConstants.BundleID.app, category: "Diagnostics")
 
@@ -1297,6 +1303,11 @@ final class DiagnosticsLog: ObservableObject {
             // Always reset to a small recent window so Refresh is fast even
             // if the user clicks it repeatedly.
             self.cursorDate = Date().addingTimeInterval(-15)
+            self.extensionLogCursor.lastEntryDate = self.cursorDate
+            // First read of the extension log on Refresh re-scans the file —
+            // file-offset cursor stays at 0 so we replay recent extension
+            // entries from disk (the date filter keeps things bounded).
+            self.extensionLogCursor.activeFileOffset = 0
             self.fetchOnPollQueue()
         }
     }
@@ -1309,6 +1320,10 @@ final class DiagnosticsLog: ObservableObject {
             // Live starts capturing from "now" so toggling on doesn't dump
             // recent history that the user didn't ask for.
             self.cursorDate = Date()
+            self.extensionLogCursor.lastEntryDate = Date()
+            // Advance the extension-log byte cursor to the current EOF so
+            // entries already on disk aren't replayed when Live is enabled.
+            self.advanceExtensionCursorToTailOnPollQueue()
         }
         // Timer fires on the main RunLoop; the actual log read hops to
         // `pollQueue` so a slow OSLogStore query never blocks the UI.
@@ -1338,47 +1353,80 @@ final class DiagnosticsLog: ObservableObject {
         pollQueue.async { [weak self] in
             guard let self = self else { return }
             self.cursorDate = Date()
+            self.extensionLogCursor.lastEntryDate = Date()
+            // Also drop the extension log file so the disk artifact doesn't
+            // grow forever and so a subsequent "Refresh" doesn't replay
+            // cleared entries.
+            SharedExtensionLog.shared.clear()
+            self.extensionLogCursor = SharedExtensionLog.Cursor()
             DispatchQueue.main.async { [weak self] in
                 self?.entries.removeAll()
             }
         }
     }
 
-    /// Run on `pollQueue`. Reads/writes `cursorDate` directly; appends results
-    /// on the main thread.
+    /// Run on `pollQueue`. Reads new entries from both the in-process OSLog
+    /// stream and the extension's shared-log file, merges them by timestamp,
+    /// and appends to `entries` on the main thread.
     private func fetchOnPollQueue() {
         dispatchPrecondition(condition: .onQueue(pollQueue))
         let cursor = cursorDate
-        guard let store = try? OSLogStore(scope: .currentProcessIdentifier) else { return }
-        let position = store.position(date: cursor)
 
-        // Filter at the store level for our subsystem -- much cheaper than
-        // pulling every system log entry and filtering in Swift.
-        let predicate = NSPredicate(format: "subsystem == %@", subsystem)
-        guard let stored = try? store.getEntries(at: position, matching: predicate) else { return }
-
-        // Hard cap the iteration: when the AravisBridge is logging ~50 entries
-        // per second, the user clicking Refresh after a minute of streaming
-        // would otherwise pull 3000+ entries in one batch and block the main
-        // thread when SwiftUI diffs the resulting ForEach update. Stopping
-        // early keeps the UI responsive; the next Refresh will pick up from
-        // where this one stopped (cursor advances to last fetched entry).
+        // --- App-process OSLog reads ---
         var fetched: [Entry] = []
         fetched.reserveCapacity(perFetchEntryLimit)
-        for entry in stored {
-            guard let logEntry = entry as? OSLogEntryLog else { continue }
-            guard logEntry.date > cursor else { continue }
-            fetched.append(Entry(
-                timestamp: logEntry.date,
-                level: Self.levelString(logEntry.level),
-                category: logEntry.category,
-                message: logEntry.composedMessage
-            ))
-            if fetched.count >= perFetchEntryLimit { break }
+        if let store = try? OSLogStore(scope: .currentProcessIdentifier) {
+            let position = store.position(date: cursor)
+            // Filter at the store level for our subsystem -- much cheaper than
+            // pulling every system log entry and filtering in Swift.
+            let predicate = NSPredicate(format: "subsystem == %@", subsystem)
+            if let stored = try? store.getEntries(at: position, matching: predicate) {
+                // Hard cap the iteration: when the AravisBridge is logging ~50
+                // entries per second, a minute of streaming would otherwise
+                // pull 3000+ entries in one batch and block the main thread
+                // when SwiftUI diffs the resulting ForEach update. Stopping
+                // early keeps the UI responsive; the next fetch will pick up
+                // from where this one stopped (cursor advances to last fetched).
+                for entry in stored {
+                    guard let logEntry = entry as? OSLogEntryLog else { continue }
+                    guard logEntry.date > cursor else { continue }
+                    fetched.append(Entry(
+                        timestamp: logEntry.date,
+                        level: Self.levelString(logEntry.level),
+                        category: logEntry.category,
+                        message: logEntry.composedMessage
+                    ))
+                    if fetched.count >= perFetchEntryLimit { break }
+                }
+                if let last = fetched.last { cursorDate = last.timestamp }
+            }
         }
 
-        guard let last = fetched.last else { return }
-        cursorDate = last.timestamp
+        // --- Extension shared-log reads ---
+        // The extension is a separate process; its Logger() calls never appear
+        // in OSLogStore(.currentProcessIdentifier). It mirrors strategic events
+        // to a JSONL file in the app group container. We tail that file and
+        // merge entries by timestamp into the same buffer.
+        let extEntries = SharedExtensionLog.shared
+            .readNewEntries(cursor: &extensionLogCursor)
+            .prefix(perFetchEntryLimit)
+            .map { ext in
+                Entry(
+                    timestamp: Date(timeIntervalSince1970: TimeInterval(ext.timestampMs) / 1000),
+                    level: Self.levelString(extLevel: ext.level),
+                    category: ext.category,
+                    message: ext.message
+                )
+            }
+        fetched.append(contentsOf: extEntries)
+
+        guard !fetched.isEmpty else { return }
+
+        // Merge by timestamp so the drawer shows a unified chronological view
+        // of app + extension events. Both sources are individually sorted but
+        // interleave at sub-second resolution during transitions.
+        fetched.sort { $0.timestamp < $1.timestamp }
+
         let snapshot = fetched
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -1387,6 +1435,16 @@ final class DiagnosticsLog: ObservableObject {
                 self.entries.removeFirst(self.entries.count - self.maxEntries)
             }
         }
+    }
+
+    /// Advance the extension-log byte cursor to the current end-of-file without
+    /// surfacing any entries. Called when toggling Live ON so we don't dump
+    /// pre-existing extension entries into the drawer.
+    private func advanceExtensionCursorToTailOnPollQueue() {
+        dispatchPrecondition(condition: .onQueue(pollQueue))
+        // Reading and discarding pushes the offset to EOF; cheap because the
+        // file is small (capped at a few MB).
+        _ = SharedExtensionLog.shared.readNewEntries(cursor: &extensionLogCursor)
     }
 
     private static func levelString(_ level: OSLogEntryLog.Level) -> String {
@@ -1398,6 +1456,15 @@ final class DiagnosticsLog: ObservableObject {
         case .fault: return "FAULT"
         case .undefined: return "?"
         @unknown default: return "?"
+        }
+    }
+
+    private static func levelString(extLevel: SharedExtensionLog.Level) -> String {
+        switch extLevel {
+        case .info: return "INFO"
+        case .notice: return "NOTICE"
+        case .warning: return "WARNING"
+        case .error: return "ERROR"
         }
     }
 

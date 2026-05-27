@@ -20,11 +20,18 @@ class StreamStateMonitor {
     private let appGroupID = "group.S368GH6KF7.com.lukechang.GigEVirtualCamera"
     private var observer: NSObjectProtocol?
     private var timer: Timer?
-    
+
+    // Last value reported to the callback. `nil` means we haven't observed
+    // a value yet, so the next read should always fire (covers startup).
+    // Without this gate the 0.25s poll and the `UserDefaults.didChangeNotification`
+    // observer combined to re-fire the callback ~7-8×/s even when the
+    // extension's `streamActive` flag hadn't changed.
+    private var lastIsActive: Bool?
+
     private var groupDefaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
     }
-    
+
     func startMonitoring(onStreamStateChange: @escaping (Bool) -> Void) {
         // Monitor UserDefaults changes
         observer = NotificationCenter.default.addObserver(
@@ -34,30 +41,33 @@ class StreamStateMonitor {
         ) { [weak self] _ in
             self?.checkStreamState(onStreamStateChange: onStreamStateChange)
         }
-        
+
         // Also poll periodically as backup
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.checkStreamState(onStreamStateChange: onStreamStateChange)
         }
-        
+
         // Check initial state
         checkStreamState(onStreamStateChange: onStreamStateChange)
     }
-    
+
     func stopMonitoring() {
         if let observer = observer {
             NotificationCenter.default.removeObserver(observer)
         }
         timer?.invalidate()
         timer = nil
+        lastIsActive = nil
     }
-    
+
     private func checkStreamState(onStreamStateChange: @escaping (Bool) -> Void) {
         guard let state = groupDefaults?.dictionary(forKey: "StreamState"),
               let isActive = state["streamActive"] as? Bool else {
             return
         }
-        
+
+        guard isActive != lastIsActive else { return }
+        lastIsActive = isActive
         onStreamStateChange(isActive)
     }
 }

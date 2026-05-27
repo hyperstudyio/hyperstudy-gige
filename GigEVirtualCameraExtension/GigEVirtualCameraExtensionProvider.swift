@@ -197,6 +197,12 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
     private var consecutiveErrorCount = 0
     private static let maxConsecutiveErrors = 8
 
+    // One-shot gate for the "first frame consumed" log. Reset in `subscribe()`
+    // so each new sink subscription emits the notice exactly once. The
+    // previous gate (`sequenceNumber == 0`) misfired on every frame because
+    // CMIO returns 0 in that closure argument under our configuration.
+    private var hasLoggedFirstFrame = false
+
     private func setSubscribing(_ value: Bool) -> Bool {
         os_unfair_lock_lock(&subscribeLock)
         defer { os_unfair_lock_unlock(&subscribeLock) }
@@ -227,6 +233,7 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
             return
         }
         consecutiveErrorCount = 0
+        hasLoggedFirstFrame = false
 
         logger.info("🔵 Sink subscribing to consume buffers from client PID: \(client.pid)")
         SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
@@ -291,13 +298,10 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
             self.consecutiveErrorCount = 0
 
             if let sampleBuffer = sampleBuffer {
-                if sequenceNumber == 0 {
-                    if let groupDefaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera") {
-                        groupDefaults.set("First frame received at \(Date())", forKey: "Debug_FirstFrameReceived")
-                        groupDefaults.synchronize()
-                    }
+                if !self.hasLoggedFirstFrame {
+                    self.hasLoggedFirstFrame = true
                     SharedExtensionLog.shared.write(level: .notice, category: "Ext.SinkStream",
-                        message: "🎉 First frame consumed from sink (seq 0)")
+                        message: "🎉 First frame consumed from sink")
                 }
 
                 if sequenceNumber % 300 == 0 {

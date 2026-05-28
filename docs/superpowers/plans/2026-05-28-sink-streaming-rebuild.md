@@ -12,11 +12,16 @@
 
 ## Conventions used in every task
 
-**Build command (app + embedded extension), run from repo root:**
+**Build command (UNSIGNED compile gate — app + embedded extension), run from repo root.** A normal/signed build fails locally with "requires a provisioning profile with the System Extension feature" because the profiles are GitHub-secrets-only. This unsigned compile (mirrors CI `build-verify.yml`) is the verification gate for every implementation task — it fully compiles the Swift/Obj-C++ without signing:
 ```bash
-xcodebuild -project GigEVirtualCamera.xcodeproj -scheme GigEVirtualCamera -configuration Debug build 2>&1 | tail -20
+ARAVIS_PREFIX="/opt/homebrew/opt/aravis"; GLIB_PREFIX="/opt/homebrew/opt/glib"; GETTEXT_PREFIX="/opt/homebrew/opt/gettext"; PCRE2_PREFIX="/opt/homebrew/opt/pcre2"
+xcodebuild -project GigEVirtualCamera.xcodeproj -scheme GigEVirtualCamera -configuration Debug -derivedDataPath build/verify \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" PROVISIONING_PROFILE_SPECIFIER="" \
+  HEADER_SEARCH_PATHS="/opt/homebrew/include ${ARAVIS_PREFIX}/include/aravis-0.8 ${GLIB_PREFIX}/include ${GLIB_PREFIX}/include/glib-2.0 ${GLIB_PREFIX}/lib/glib-2.0/include ${GETTEXT_PREFIX}/include ${PCRE2_PREFIX}/include /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/ffi" \
+  LIBRARY_SEARCH_PATHS="/opt/homebrew/lib ${ARAVIS_PREFIX}/lib" \
+  build 2>&1 | tail -15
 ```
-Expected: ends with `** BUILD SUCCEEDED **`.
+Expected: ends with `** BUILD SUCCEEDED **`. Signed builds, `install_app.sh`, `clean_reinstall_extension.sh`, and all hardware testing are CI/user-run (Task 9).
 
 **Unit tests (pure logic only):**
 ```bash
@@ -646,9 +651,9 @@ This is where end-to-end behavior is proven. Steps 3–5 require hardware/a huma
 
 **Files:** none (verification)
 
-- [ ] **Step 1: Full build + reinstall the extension**
+- [ ] **Step 1: Full build + reinstall the extension (USER-RUN — needs signing)**
 
-Run the Build command (expect `** BUILD SUCCEEDED **`), then install and reinstall the extension:
+First confirm the unsigned compile gate passes (Build command). Then, because installing a system extension requires the signed build with the GitHub-secrets provisioning profiles, the signed build + install is run by the user (or via CI artifact):
 ```bash
 ./Scripts/install_app.sh
 ./Scripts/clean_reinstall_extension.sh

@@ -148,30 +148,50 @@ class CameraManager: NSObject, ObservableObject {
     private var lastDiscoveryTime = Date.distantPast
 
     /// Stall watchdog. Ticks 2 Hz; flips `streamStalled` when no frame has been
-    /// sent in `streamStallTimeoutSec`. Triggers one-shot sink-reconnect recovery
-    /// on stall entry.
+    /// sent in `streamStallTimeoutSec`. Detection-only: surfaces the banner so
+    /// the operator knows frames stopped, no destructive recovery action. The
+    /// previous automatic disconnect+rediscover ran during transient camera
+    /// glitches and made things worse — see the commit log.
     private var streamStallWatchdog: Timer?
     private let streamStallTimeoutSec: Double = 2.0
-    private var hasAttemptedRecoveryThisStall = false
 
-    /// CLOCK_UPTIME_RAW timestamp of the most recent sink connection-state
-    /// transition (connect or disconnect) reported by `CMIOSinkConnector`. Used
-    /// by the stall watchdog as a grace gate: the macOS CMIO infrastructure
-    /// frequently recycles the sink stream when consumers attach/detach or
-    /// the network reconfigures, and during those ~100–500 ms windows no
-    /// frames flow. Without this gate the watchdog tripped 99 ms after a sink
-    /// reattach completed and the recovery action tore down the sink that
-    /// had just come back. 0 means "no transition observed yet."
-    private var lastSinkTransitionUptimeNs: UInt64 = 0
-    private let sinkTransitionGraceSec: Double = 3.0
+    /// CLOCK_UPTIME_RAW timestamp of the most recent known frame-pipeline
+    /// disruption — a sink transition, a network reconfiguration, a
+    /// camera-switch initiated by the user, or any other event after which
+    /// frames are expected to be temporarily absent. Read by the stall
+    /// watchdog: while we're within `pipelineGraceSec` of a disruption,
+    /// no banner is shown.
+    ///
+    /// Updated via `noteDisruption(_:)` at every entry point that signals
+    /// a known-cause frame interruption. Critically we update at the
+    /// *earliest* observable signal (e.g. when the network monitor fires
+    /// the suppression path), not at the lagging sink-availability
+    /// callback — the OS notifies us about the sink transition ~hundreds
+    /// of ms after frames have already stopped flowing, so a grace gate
+    /// keyed only off the sink callback fires its first useful tick too
+    /// late to suppress the false stall.
+    ///
+    /// 0 means "no transition observed yet."
+    private var lastPipelineDisruptionUptimeNs: UInt64 = 0
+    private let pipelineGraceSec: Double = 3.0
     /// Cached sink-availability state so we only refresh
-    /// `lastSinkTransitionUptimeNs` on an actual state flip. The CMIO
+    /// `lastPipelineDisruptionUptimeNs` on an actual state flip. The CMIO
     /// property listener can fire `onSinkStreamAvailable(true)` repeatedly
     /// during an attach sequence; refreshing the timestamp on every fire
-    /// would slide the 3-second grace window forward indefinitely under
+    /// would slide the grace window forward indefinitely under
     /// pathological reconnect churn, permanently disabling stall detection.
     private var lastSinkAvailabilityState: Bool? = nil
     private var lastSinkConnectedState: Bool? = nil
+
+    /// Record a known pipeline disruption. The stall watchdog will suppress
+    /// the banner for `pipelineGraceSec` after this is called. Use the
+    /// `reason` for logging context — not all disruptions are noisy enough
+    /// to warrant their own log line, and a single sentinel function keeps
+    /// the call sites consistent.
+    private func noteDisruption(_ reason: StaticString) {
+        lastPipelineDisruptionUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        logger.debug("Pipeline disruption noted: \(reason)")
+    }
     
     // MARK: - Computed Properties
     var statusText: String {
@@ -267,6 +287,13 @@ class CameraManager: NSObject, ObservableObject {
             // surfaces the failure in the UI.
             if self.isConnected && GigECameraManager.shared.isStreaming {
                 self.logger.info("Network change while streaming - skipping discovery broadcast")
+                // Earliest signal that frames are about to stop. The OS
+                // reports the network change ~1-2 s AFTER the camera
+                // actually goes silent (the camera glitches first, the
+                // network stack notices second), but noting the
+                // disruption here still bumps the grace window so the
+                // watchdog tick that follows suppresses the banner.
+                self.noteDisruption("network change while streaming")
                 self.checkCameraConnection()
                 return
             }
@@ -330,7 +357,13 @@ class CameraManager: NSObject, ObservableObject {
     
     private func connectToCamera(withId cameraId: String) {
         let gigEManager = GigECameraManager.shared
-        
+
+        // User-initiated camera switch is a multi-second teardown +
+        // re-attach during which no frames will flow. Note it before any
+        // log line so the watchdog tick that follows the user's click
+        // sees a fresh disruption timestamp.
+        noteDisruption("connectToCamera")
+
         logger.info("Attempting to connect to camera: \(cameraId)")
         connectionState = "Connecting"
         connectionAttempts += 1
@@ -462,6 +495,7 @@ class CameraManager: NSObject, ObservableObject {
     
     private func disconnectCamera() {
         let gigEManager = GigECameraManager.shared
+        noteDisruption("disconnectCamera")
         gigEManager.disconnect()
         isConnected = false
         cameraModel = "Unknown"
@@ -649,6 +683,11 @@ class CameraManager: NSObject, ObservableObject {
             // If camera is connected, ensure sink connection and restart streaming
             if isConnected {
                 let gigEManager = GigECameraManager.shared
+
+                // The stop/restart sequence below intentionally interrupts
+                // frame flow for ~0.5–1.5 s. Mark it so the watchdog
+                // doesn't false-positive during the restart window.
+                noteDisruption("new client - stream restart")
 
                 // First ensure sink is connected
                 if !isFrameSenderConnected {
@@ -920,7 +959,7 @@ class CameraManager: NSObject, ObservableObject {
             // grace window. See `lastSinkAvailabilityState` declaration.
             if self.lastSinkAvailabilityState != available {
                 self.lastSinkAvailabilityState = available
-                self.lastSinkTransitionUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                self.noteDisruption("sink availability flip")
                 self.logger.info("Sink stream availability changed: \(available)")
             }
 
@@ -939,7 +978,7 @@ class CameraManager: NSObject, ObservableObject {
                 // (see `lastSinkConnectedState`).
                 if self.lastSinkConnectedState != connected {
                     self.lastSinkConnectedState = connected
-                    self.lastSinkTransitionUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                    self.noteDisruption("sink connection flip")
                 }
                 self.isFrameSenderConnected = connected
 
@@ -992,7 +1031,6 @@ class CameraManager: NSObject, ObservableObject {
         guard isStreaming else {
             if streamStalled { streamStalled = false }
             if streamStallDurationSec != 0 { streamStallDurationSec = 0 }
-            hasAttemptedRecoveryThisStall = false
             return
         }
 
@@ -1015,36 +1053,23 @@ class CameraManager: NSObject, ObservableObject {
         guard sessionSendCount > consumerActiveThreshold else {
             if streamStalled { streamStalled = false }
             if streamStallDurationSec != 0 { streamStallDurationSec = 0 }
-            hasAttemptedRecoveryThisStall = false
             return
         }
 
-        // Sink-transition grace period.
+        // Pipeline disruption grace period.
         //
-        // The CMIO sink stream is recycled by macOS whenever a consumer
-        // attaches/detaches or the network reconfigures. During the ~100–500 ms
-        // window between Ext.SinkStream "Stopping" and "Starting" the sink is
-        // momentarily down but coming back on its own via the property
-        // listener. Without this gate the watchdog observed the cumulative dead
-        // time, fired a stall ~99 ms after the sink came back, and the recovery
-        // tore down the sink that was already mid-reattach — producing the
-        // exact cascade visible in MRC-camera diagnostics.
-        if lastSinkTransitionUptimeNs != 0 {
-            let nsSinceTransition = nowUptimeNs &- lastSinkTransitionUptimeNs
+        // Any known-cause frame interruption — sink transition, network
+        // reconfiguration, user-initiated camera switch, Aravis stream
+        // restart — bumps `lastPipelineDisruptionUptimeNs`. While we're
+        // within `pipelineGraceSec` of one of those events we suppress
+        // the banner: frames are expected to be temporarily absent.
+        if lastPipelineDisruptionUptimeNs != 0 {
+            let nsSinceTransition = nowUptimeNs &- lastPipelineDisruptionUptimeNs
             let secSinceTransition = Double(nsSinceTransition) / 1_000_000_000.0
-            if secSinceTransition < sinkTransitionGraceSec {
+            if secSinceTransition < pipelineGraceSec {
                 if streamStalled { streamStalled = false }
                 if streamStallDurationSec != 0 { streamStallDurationSec = 0 }
-                // Match the sibling early-returns above and reset
-                // `hasAttemptedRecoveryThisStall`. Because
-                // `attemptStreamStallRecovery()` itself triggers a sink
-                // transition (disconnect + force rediscovery), every recovery
-                // immediately bumps the watchdog into this grace window;
-                // without the reset, the recovery flag stays `true` for the
-                // rest of the session and the second real stall in a session
-                // is never recovered from.
-                hasAttemptedRecoveryThisStall = false
-                return
+                    return
             }
         }
 
@@ -1062,27 +1087,16 @@ class CameraManager: NSObject, ObservableObject {
             // Double instead — numeric interpolations are public.
             let rounded = (elapsedSec * 10).rounded() / 10
             logger.warning("⚠️ Stream stall detected -- no frame sent in \(rounded)s")
-            if !hasAttemptedRecoveryThisStall {
-                hasAttemptedRecoveryThisStall = true
-                attemptStreamStallRecovery()
-            }
+            // Detection only. The previous automatic
+            // disconnect+forceRediscovery ran during transient camera-side
+            // glitches and made the gap longer, not shorter. The banner's
+            // Recover button still exists if the user wants to force a sink
+            // rebuild for a stuck session; it routes through
+            // `retryFrameSenderConnection()`.
         } else if !timedOut, streamStalled {
             streamStalled = false
-            hasAttemptedRecoveryThisStall = false
             logger.info("Stream recovered -- frames flowing again")
         }
-    }
-
-    private func attemptStreamStallRecovery() {
-        logger.warning("Attempting one-shot stream-stall recovery: sink disconnect + forced rediscovery")
-        // disconnect() nils the cached sink IDs, then forceRediscovery()
-        // enumerates CMIO devices and reattaches if our sink is registered.
-        // The previous connect()-only call was a no-op in the most common
-        // failure mode — once IDs were cleared, only a CMIO property-changed
-        // callback could re-populate them, and that callback doesn't fire
-        // when the OS still considers the sink stream registered.
-        sinkConnector.disconnect()
-        sinkConnector.forceRediscovery()
     }
     
     func getPerformanceMetrics() -> (fps: Double, framesTotal: UInt64, framesDropped: UInt64) {

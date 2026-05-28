@@ -123,6 +123,14 @@ class CMIOSinkConnector {
     // the queue and the count grows continuously.
     private var _sessionSendCount: UInt64 = 0
 
+    // Mach-uptime ns of the first successful enqueue in the current sink
+    // session. Combined with `_sessionSendCount` and
+    // `_lastSuccessfulSendUptimeNs` gives a session-average measured fps —
+    // the value the diagnostic export reports as the format's effective
+    // frame rate. 0 means "no frame yet this session." Protected by
+    // `livenessLock`.
+    private var _sessionFirstSendUptimeNs: UInt64 = 0
+
     private var livenessLock = os_unfair_lock()
 
     /// Thread-safe accessor for the watchdog. Returns 0 if no frame has ever
@@ -150,6 +158,25 @@ class CMIOSinkConnector {
         os_unfair_lock_lock(&livenessLock)
         defer { os_unfair_lock_unlock(&livenessLock) }
         return _sessionSendCount
+    }
+
+    /// Average measured fps over the current sink session, or `nil` if no
+    /// frames have flowed yet (or only one frame has, so no interval to
+    /// average over). Used by the diagnostics export so the reported format
+    /// reflects what the camera is actually delivering — necessary because
+    /// some cameras (notably the MRC GVRD-MRC) silently cap below the
+    /// requested rate, and `cameraManager.frameRate` only tracks the
+    /// configured target.
+    var measuredFps: Double? {
+        os_unfair_lock_lock(&livenessLock)
+        defer { os_unfair_lock_unlock(&livenessLock) }
+        guard _sessionFirstSendUptimeNs != 0,
+              _lastSuccessfulSendUptimeNs > _sessionFirstSendUptimeNs,
+              _sessionSendCount > 1 else { return nil }
+        let elapsedNs = _lastSuccessfulSendUptimeNs &- _sessionFirstSendUptimeNs
+        let elapsedSec = Double(elapsedNs) / 1_000_000_000.0
+        // `_sessionSendCount - 1` intervals between `_sessionSendCount` frames.
+        return Double(_sessionSendCount - 1) / elapsedSec
     }
 
     // Stream state monitoring
@@ -327,6 +354,7 @@ class CMIOSinkConnector {
         _lastSuccessfulSendUptimeNs = 0
         _nonMonotonicNudges = 0
         _sessionSendCount = 0
+        _sessionFirstSendUptimeNs = 0
         os_unfair_lock_unlock(&livenessLock)
 
         isConnected = true
@@ -442,6 +470,9 @@ class CMIOSinkConnector {
             let nowUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
             os_unfair_lock_lock(&livenessLock)
             _lastSuccessfulSendUptimeNs = nowUptimeNs
+            if _sessionFirstSendUptimeNs == 0 {
+                _sessionFirstSendUptimeNs = nowUptimeNs
+            }
             _sessionSendCount &+= 1
             os_unfair_lock_unlock(&livenessLock)
 

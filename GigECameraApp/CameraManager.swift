@@ -124,10 +124,25 @@ class CameraManager: NSObject, ObservableObject {
     /// timestamp forward. Should stay at 0 in healthy operation.
     @Published var ptsNudgeCount: UInt64 = 0
 
+    /// Average measured fps over the current sink session, or `nil` if no
+    /// frames have flowed yet. Read by the diagnostic snapshot so the
+    /// reported format reflects what the camera is actually delivering —
+    /// some cameras silently cap below the requested rate.
+    var measuredFps: Double? { sinkConnector.measuredFps }
+
     // MARK: - Private Properties
     private let sinkConnector = CMIOSinkConnector()
     private var frameCount: Int = 0
     private var streamStateObserver: NSKeyValueObservation?
+    /// Reentry guard for `handleStreamStateChange`. The handler clears the
+    /// `newClientConnected` flag by writing back to UserDefaults, which
+    /// synchronously re-triggers the same KVO observer on the same thread.
+    /// Without this guard, that reentry processes `streamActive==false` while
+    /// the outer call is mid-flight and the outer call then *also* falls
+    /// through to the same branch — producing the duplicate
+    /// "Extension stopped requesting frames"/"Stopping Aravis streaming" pair
+    /// seen in client-attach diagnostics.
+    private var isHandlingStreamState = false
     private let appGroupDefaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera")
     private let networkMonitor = NetworkInterfaceMonitor()
     private var lastDiscoveryTime = Date.distantPast
@@ -138,6 +153,25 @@ class CameraManager: NSObject, ObservableObject {
     private var streamStallWatchdog: Timer?
     private let streamStallTimeoutSec: Double = 2.0
     private var hasAttemptedRecoveryThisStall = false
+
+    /// CLOCK_UPTIME_RAW timestamp of the most recent sink connection-state
+    /// transition (connect or disconnect) reported by `CMIOSinkConnector`. Used
+    /// by the stall watchdog as a grace gate: the macOS CMIO infrastructure
+    /// frequently recycles the sink stream when consumers attach/detach or
+    /// the network reconfigures, and during those ~100–500 ms windows no
+    /// frames flow. Without this gate the watchdog tripped 99 ms after a sink
+    /// reattach completed and the recovery action tore down the sink that
+    /// had just come back. 0 means "no transition observed yet."
+    private var lastSinkTransitionUptimeNs: UInt64 = 0
+    private let sinkTransitionGraceSec: Double = 3.0
+    /// Cached sink-availability state so we only refresh
+    /// `lastSinkTransitionUptimeNs` on an actual state flip. The CMIO
+    /// property listener can fire `onSinkStreamAvailable(true)` repeatedly
+    /// during an attach sequence; refreshing the timestamp on every fire
+    /// would slide the 3-second grace window forward indefinitely under
+    /// pathological reconnect churn, permanently disabling stall detection.
+    private var lastSinkAvailabilityState: Bool? = nil
+    private var lastSinkConnectedState: Bool? = nil
     
     // MARK: - Computed Properties
     var statusText: String {
@@ -214,20 +248,42 @@ class CameraManager: NSObject, ObservableObject {
     private func setupNetworkMonitoring() {
         networkMonitor.onNetworkChange = { [weak self] in
             guard let self = self else { return }
-            
+
+            // Suppress network-driven rediscovery while a real GigE camera is
+            // connected and streaming.
+            //
+            // Aravis discovery is a GVCP broadcast that interrupts every
+            // device's stream while they respond — including the camera we
+            // are already talking to. The MRC camera shares the network
+            // interface whose link state we're monitoring, so its own
+            // DHCP/link transitions trigger the discovery that then
+            // disrupts its streaming, which trips the stall watchdog,
+            // which tears down the sink that's mid-recovery. Skipping
+            // discovery here breaks that closed loop.
+            //
+            // We only suppress the broadcast, not the connection-health
+            // check; if the link change actually killed our camera,
+            // `checkCameraConnection()` flips `isConnected` to false and
+            // surfaces the failure in the UI.
+            if self.isConnected && GigECameraManager.shared.isStreaming {
+                self.logger.info("Network change while streaming - skipping discovery broadcast")
+                self.checkCameraConnection()
+                return
+            }
+
             // Debounce discovery calls - don't run more than once per 2 seconds
             let timeSinceLastDiscovery = Date().timeIntervalSince(self.lastDiscoveryTime)
             guard timeSinceLastDiscovery > 2.0 else {
                 self.logger.info("Skipping discovery - too soon since last check (\(timeSinceLastDiscovery)s)")
                 return
             }
-            
+
             self.lastDiscoveryTime = Date()
             self.logger.info("Network change detected - triggering camera discovery")
-            
+
             // Run discovery
             GigECameraManager.shared.discoverCameras()
-            
+
             // If we lost connection, also check connection status
             if self.isConnected {
                 self.checkCameraConnection()
@@ -473,22 +529,30 @@ class CameraManager: NSObject, ObservableObject {
             object: nil
         )
         
-        // Monitor App Group UserDefaults for stream state changes
+        // Monitor App Group UserDefaults for stream state changes.
+        //
+        // We deliberately rely on KVO alone here. An earlier
+        // `UserDefaults.didChangeNotification` "backup" observer fired on every
+        // local UserDefaults write (including unrelated keys like
+        // `SelectedFormatWidth`), which produced spurious extra invocations of
+        // this handler and helped duplicate the stream-stop log pair seen in
+        // diagnostics. `didChangeNotification` does not deliver cross-process
+        // changes anyway, so it added noise without adding signal.
+        //
+        // The KVO closure hops to the main queue explicitly. Cross-process
+        // KVO delivery for App Group UserDefaults can land on a CFPrefs
+        // background thread, and `handleStreamStateChange` mutates
+        // `@MainActor`-isolated state (the `isHandlingStreamState` reentry
+        // guard and `@Published` properties on the manager). Forcing the
+        // main hop both satisfies isolation and makes the reentry guard
+        // single-threaded.
         if let defaults = appGroupDefaults {
-            // Use KVO to monitor changes
             streamStateObserver = defaults.observe(\.StreamState, options: [.new, .initial]) { [weak self] _, _ in
-                self?.handleStreamStateChange()
+                DispatchQueue.main.async {
+                    self?.handleStreamStateChange()
+                }
             }
-            
-            // Also use notification as backup
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(handleStreamStateChange),
-                name: UserDefaults.didChangeNotification,
-                object: defaults
-            )
-            
-            // Check initial state
+
             handleStreamStateChange()
         }
     }
@@ -558,33 +622,41 @@ class CameraManager: NSObject, ObservableObject {
     }
     
     @objc private func handleStreamStateChange() {
+        // Reentry guard. Clearing `newClientConnected` below re-triggers the
+        // KVO observer synchronously; without this, the reentrant call would
+        // process `streamActive==false` and then the outer call would *also*
+        // fall through to the same branch, logging the stop pair twice.
+        guard !isHandlingStreamState else { return }
+        isHandlingStreamState = true
+        defer { isHandlingStreamState = false }
+
         // Check if extension is requesting frames
         guard let defaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera"),
               let state = defaults.dictionary(forKey: "StreamState") else {
             return
         }
-        
+
         // Check for new client connection
         if let newClientConnected = state["newClientConnected"] as? Bool, newClientConnected {
             logger.info("New client connected - restarting camera stream to ensure frames flow")
-            
+
             // Clear the flag
             var updatedState = state
             updatedState["newClientConnected"] = false
             defaults.set(updatedState, forKey: "StreamState")
             defaults.synchronize()
-            
+
             // If camera is connected, ensure sink connection and restart streaming
             if isConnected {
                 let gigEManager = GigECameraManager.shared
-                
+
                 // First ensure sink is connected
                 if !isFrameSenderConnected {
                     logger.info("New client connected but sink not ready - reconnecting sink first...")
                     sinkConnector.disconnect()
                     let connected = sinkConnector.connect()
                     logger.info("Sink reconnection attempt returned: \(connected)")
-                    
+
                     // Give sink time to connect before starting stream
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                         if self.isFrameSenderConnected {
@@ -601,7 +673,7 @@ class CameraManager: NSObject, ObservableObject {
                     if gigEManager.isStreaming {
                         logger.info("Stopping current stream...")
                         gigEManager.stopStreaming()
-                        
+
                         // Small delay before restarting
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                             self.logger.info("Restarting stream for new client...")
@@ -613,8 +685,16 @@ class CameraManager: NSObject, ObservableObject {
                     }
                 }
             }
+
+            // Don't fall through to the streamActive check on the same call.
+            // The new-client branch already orchestrates its own stop/restart;
+            // processing `streamActive==false` here would issue a redundant
+            // `stopStreaming()` and double-log "Extension stopped requesting
+            // frames" / "Stopping Aravis streaming". A later KVO fire driven
+            // by an actual `streamActive` write will pick that up.
+            return
         }
-        
+
         // Check if streaming is active
         if let isActive = state["streamActive"] as? Bool {
             if isActive {
@@ -834,20 +914,33 @@ class CameraManager: NSObject, ObservableObject {
         // Called when sink stream becomes available
         sinkConnector.onSinkStreamAvailable = { [weak self] available in
             guard let self = self else { return }
-            
-            self.logger.info("Sink stream availability changed: \(available)")
-            
+
+            // Only refresh the grace timestamp on an actual state flip;
+            // re-fires with the same logical state shouldn't extend the
+            // grace window. See `lastSinkAvailabilityState` declaration.
+            if self.lastSinkAvailabilityState != available {
+                self.lastSinkAvailabilityState = available
+                self.lastSinkTransitionUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                self.logger.info("Sink stream availability changed: \(available)")
+            }
+
             if available && self.isConnected && !GigECameraManager.shared.isStreaming {
                 self.logger.info("Sink stream available - starting Aravis streaming automatically")
                 GigECameraManager.shared.startStreaming()
             }
         }
-        
+
         // Called when connection state changes
         sinkConnector.onConnectionStateChanged = { [weak self] connected in
             DispatchQueue.main.async {
                 guard let self = self else { return }
 
+                // Only refresh the grace timestamp on an actual state flip
+                // (see `lastSinkConnectedState`).
+                if self.lastSinkConnectedState != connected {
+                    self.lastSinkConnectedState = connected
+                    self.lastSinkTransitionUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                }
                 self.isFrameSenderConnected = connected
 
                 if connected {
@@ -926,6 +1019,35 @@ class CameraManager: NSObject, ObservableObject {
             return
         }
 
+        // Sink-transition grace period.
+        //
+        // The CMIO sink stream is recycled by macOS whenever a consumer
+        // attaches/detaches or the network reconfigures. During the ~100–500 ms
+        // window between Ext.SinkStream "Stopping" and "Starting" the sink is
+        // momentarily down but coming back on its own via the property
+        // listener. Without this gate the watchdog observed the cumulative dead
+        // time, fired a stall ~99 ms after the sink came back, and the recovery
+        // tore down the sink that was already mid-reattach — producing the
+        // exact cascade visible in MRC-camera diagnostics.
+        if lastSinkTransitionUptimeNs != 0 {
+            let nsSinceTransition = nowUptimeNs &- lastSinkTransitionUptimeNs
+            let secSinceTransition = Double(nsSinceTransition) / 1_000_000_000.0
+            if secSinceTransition < sinkTransitionGraceSec {
+                if streamStalled { streamStalled = false }
+                if streamStallDurationSec != 0 { streamStallDurationSec = 0 }
+                // Match the sibling early-returns above and reset
+                // `hasAttemptedRecoveryThisStall`. Because
+                // `attemptStreamStallRecovery()` itself triggers a sink
+                // transition (disconnect + force rediscovery), every recovery
+                // immediately bumps the watchdog into this grace window;
+                // without the reset, the recovery flag stays `true` for the
+                // rest of the session and the second real stall in a session
+                // is never recovered from.
+                hasAttemptedRecoveryThisStall = false
+                return
+            }
+        }
+
         let elapsedNs = nowUptimeNs &- lastSendNs
         let elapsedSec = Double(elapsedNs) / 1_000_000_000.0
         let timedOut = elapsedSec > streamStallTimeoutSec
@@ -934,8 +1056,12 @@ class CameraManager: NSObject, ObservableObject {
 
         if timedOut, !streamStalled {
             streamStalled = true
-            let elapsedRounded = String(format: "%.1f", elapsedSec)
-            logger.warning("⚠️ Stream stall detected -- no frame sent in \(elapsedRounded)s")
+            // OSLog redacts Swift `String` interpolations by default, which is
+            // why `String(format: "%.1f", elapsedSec)` showed up as
+            // `<private>s` in diagnostic exports. Round to one decimal as a
+            // Double instead — numeric interpolations are public.
+            let rounded = (elapsedSec * 10).rounded() / 10
+            logger.warning("⚠️ Stream stall detected -- no frame sent in \(rounded)s")
             if !hasAttemptedRecoveryThisStall {
                 hasAttemptedRecoveryThisStall = true
                 attemptStreamStallRecovery()
@@ -1051,10 +1177,19 @@ class CameraManager: NSObject, ObservableObject {
         gigEManager.setExposureTime(clamped)
         logger.info("Updated exposure time to \(clamped) µs")
 
-        // Verify the change was applied
+        // Verify the change was applied. Some cameras (notably the MRC
+        // GVRD-MRC MR-CAM-HR seen in diagnostics) accept the write but
+        // return 0 µs on read-back, silently ignoring the requested value.
+        // Log a mismatch louder than a match so the discrepancy isn't lost
+        // in routine INFO traffic.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            if let actualExposure = gigEManager.getExposureTime() {
-                self?.logger.info("Verified exposure time: \(actualExposure) µs")
+            guard let self = self else { return }
+            guard let actualExposure = gigEManager.getExposureTime() else { return }
+            let tolerance = max(1.0, clamped * 0.01)  // 1% or 1 µs, whichever is larger
+            if abs(actualExposure - clamped) > tolerance {
+                self.logger.warning("⚠️ Exposure readback \(actualExposure) µs differs from requested \(clamped) µs — camera ignored the write")
+            } else {
+                self.logger.info("Verified exposure time: \(actualExposure) µs")
             }
         }
     }
@@ -1472,7 +1607,28 @@ final class DiagnosticsLog: ObservableObject {
 
     @MainActor
     func captureSnapshot(from cameraManager: CameraManager) -> Snapshot {
-        Snapshot(
+        // Prefer the live frame dimensions and measured fps over
+        // `cameraManager.currentFormat` / `cameraManager.frameRate`, which
+        // only track the user-selected preset. AravisBridge updates
+        // `currentResolution()` on every received frame and the sink
+        // connector tracks the actual send rate, so the diagnostic format
+        // reflects what is flowing rather than what was requested. Some
+        // cameras (notably the MRC GVRD-MRC) silently cap below the
+        // configured rate; falling back to `cameraManager.frameRate` only
+        // when no measurement is available preserves a sensible value
+        // before any frames have flowed.
+        let liveFormat: String = {
+            guard cameraManager.isConnected,
+                  let res = GigECameraManager.shared.getCurrentResolution(),
+                  res.width > 0, res.height > 0 else {
+                return cameraManager.currentFormat
+            }
+            let fpsValue = cameraManager.measuredFps ?? cameraManager.frameRate
+            let fps = Int(fpsValue.rounded())
+            return "\(Int(res.width))×\(Int(res.height)) @ \(fps)fps"
+        }()
+
+        return Snapshot(
             timestamp: Date(),
             appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?",
             appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?",
@@ -1484,7 +1640,7 @@ final class DiagnosticsLog: ObservableObject {
             streamStalled: cameraManager.streamStalled,
             streamStallDurationSec: cameraManager.streamStallDurationSec,
             ptsNudgeCount: cameraManager.ptsNudgeCount,
-            currentFormat: cameraManager.currentFormat,
+            currentFormat: liveFormat,
             frameRate: cameraManager.frameRate,
             exposureTime: cameraManager.exposureTime,
             gain: cameraManager.gain,

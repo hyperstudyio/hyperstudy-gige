@@ -816,20 +816,30 @@ class CameraManager: NSObject, ObservableObject {
             groupDefaults.synchronize()
         }
         
-        // Apply resolution to camera if connected
+        // Apply resolution to camera if connected.
+        //
+        // The MRC camera intermittently rejects resolution/format writes. A
+        // FAILED write must never disrupt the live video path: we log and
+        // bail out without touching the stream. Only a write that the camera
+        // actually accepted is allowed to drive a stream restart below, since
+        // the running stream is then carrying the old geometry.
+        var resolutionApplied = false
         if isConnected && selectedFormatIndex != 0 { // Not Auto
             let resolution = CGSize(width: width, height: height)
             if GigECameraManager.shared.setResolution(resolution) {
                 logger.info("Successfully set camera resolution to \(width)×\(height)")
+                resolutionApplied = true
             } else {
-                logger.warning("Failed to set camera resolution")
+                logger.warning("Failed to set camera resolution - leaving stream untouched")
             }
         }
-        
-        // If streaming, we might need to restart
-        if isConnected && GigECameraManager.shared.isStreaming {
+
+        // Restart the stream only if the camera accepted a new resolution.
+        // A failed control write leaves the stream running on its current
+        // geometry rather than tearing it down.
+        if resolutionApplied && GigECameraManager.shared.isStreaming {
             logger.info("Format changed while streaming - restarting stream")
-            
+
             GigECameraManager.shared.stopStreaming()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 GigECameraManager.shared.startStreaming()

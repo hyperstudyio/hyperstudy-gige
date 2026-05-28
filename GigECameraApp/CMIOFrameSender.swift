@@ -194,6 +194,14 @@ class CMIOSinkConnector {
     private var connectionRetryCount = 0
     private let maxRetryAttempts = 3
     private let retryDelay: TimeInterval = 2.0
+
+    // Drives initial connection: polls discovery every second until the sink
+    // is connected, then stops. This is connection-establishment correctness,
+    // NOT a recovery watchdog — once connected it never polls again. Replaces
+    // the previous one-shot-at-launch + property-listener-only path that sat
+    // silent forever if it missed the initial CMIO change event.
+    private var connectPollTimer: Timer?
+    private var connectPollAttempts = 0
     
     init() {
         logger.info("CMIOSinkConnector initialized - starting property listener setup")
@@ -212,6 +220,7 @@ class CMIOSinkConnector {
     deinit {
         connectionRetryTimer?.invalidate()
         connectionRetryTimer = nil
+        connectPollTimer?.invalidate()
         propertyListener?.stopListening()
         streamStateMonitor.stopMonitoring()
     }
@@ -277,40 +286,48 @@ class CMIOSinkConnector {
     
     // MARK: - Public Interface
 
+    @discardableResult
     func connect() -> Bool {
-        logger.info("Connect called - waiting for sink stream discovery via property listener...")
+        if isConnected { return true }
+        if propertyListener == nil { setupPropertyListener() }
 
-        if propertyListener == nil {
-            setupPropertyListener()
+        // If we already have discovered IDs, connect now.
+        if let streamID = sinkStreamID, let deviceID = deviceID,
+           connectToSinkStream(streamID: streamID, deviceID: deviceID) {
+            return true
         }
 
-        // If we already have a discovered sink stream, connect to it
-        if let streamID = sinkStreamID, let deviceID = deviceID {
-            return connectToSinkStream(streamID: streamID, deviceID: deviceID)
-        }
-
-        // We don't have IDs yet. The property listener has been registered,
-        // but it only fires on CMIO change notifications — if the sink stream
-        // is already registered with the OS and unchanged since we missed the
-        // initial event, the listener will sit silent forever. Re-run manual
-        // discovery so a stall-recovery / user-initiated retry isn't a no-op.
-        logger.info("No cached sink IDs; running manual CMIO discovery as fallback")
+        // Otherwise actively discover+connect, and keep polling until we do.
         tryManualDiscovery()
+        if isConnected { return true }
+        startConnectPolling()
         return false
     }
 
-    /// Public-facing forced rediscovery. Used by the stall watchdog and the
-    /// "Retry CMIO Sink" button. Bypasses any cached state — it asks CMIO for
-    /// the current device list and tries to attach if our sink stream is
-    /// present. Without this, the listener-only path was a dead end: after
-    /// `handleDisconnection` cleared the IDs, nothing re-fetched them and the
-    /// app waited forever for a property-changed callback that never came.
-    func forceRediscovery() {
-        logger.info("Forced rediscovery requested")
-        if propertyListener == nil {
-            setupPropertyListener()
+    private func startConnectPolling() {
+        guard connectPollTimer == nil else { return }
+        connectPollAttempts = 0
+        connectPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.isConnected { self.stopConnectPolling(); return }
+            self.connectPollAttempts += 1
+            // After 10 quick attempts, the device almost certainly isn't there
+            // (extension not installed/approved). Keep trying, but slower, and
+            // surface a clear, actionable log line — not a silent dead end.
+            if self.connectPollAttempts == 10 {
+                self.logger.error("Virtual camera device not found after 10s — is the extension installed and approved in System Settings?")
+            }
+            if self.connectPollAttempts > 10 && self.connectPollAttempts % 5 != 0 {
+                return  // throttle to once every 5s past the first 10 attempts
+            }
+            self.tryManualDiscovery()
+            if self.isConnected { self.stopConnectPolling() }
         }
-        tryManualDiscovery()
+    }
+
+    private func stopConnectPolling() {
+        connectPollTimer?.invalidate()
+        connectPollTimer = nil
     }
 
     func disconnect() {
@@ -358,6 +375,7 @@ class CMIOSinkConnector {
         os_unfair_lock_unlock(&livenessLock)
 
         isConnected = true
+        stopConnectPolling()
         connectionRetryCount = 0  // Reset retry count on success
         logger.info("✅ Successfully connected to virtual camera sink stream via property listener!")
         

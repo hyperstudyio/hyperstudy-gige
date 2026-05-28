@@ -13,65 +13,6 @@ import os.log
 import os.lock
 import FramePipelineKit
 
-// MARK: - Stream State Monitor
-
-class StreamStateMonitor {
-    private let logger = Logger(subsystem: "com.lukechang.GigEVirtualCamera", category: "StreamStateMonitor")
-    private let appGroupID = "group.S368GH6KF7.com.lukechang.GigEVirtualCamera"
-    private var observer: NSObjectProtocol?
-    private var timer: Timer?
-
-    // Last value reported to the callback. `nil` means we haven't observed
-    // a value yet, so the next read should always fire (covers startup).
-    // Without this gate the 0.25s poll and the `UserDefaults.didChangeNotification`
-    // observer combined to re-fire the callback ~7-8×/s even when the
-    // extension's `streamActive` flag hadn't changed.
-    private var lastIsActive: Bool?
-
-    private var groupDefaults: UserDefaults? {
-        UserDefaults(suiteName: appGroupID)
-    }
-
-    func startMonitoring(onStreamStateChange: @escaping (Bool) -> Void) {
-        // Monitor UserDefaults changes
-        observer = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification,
-            object: groupDefaults,
-            queue: .main
-        ) { [weak self] _ in
-            self?.checkStreamState(onStreamStateChange: onStreamStateChange)
-        }
-
-        // Also poll periodically as backup
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            self?.checkStreamState(onStreamStateChange: onStreamStateChange)
-        }
-
-        // Check initial state
-        checkStreamState(onStreamStateChange: onStreamStateChange)
-    }
-
-    func stopMonitoring() {
-        if let observer = observer {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        timer?.invalidate()
-        timer = nil
-        lastIsActive = nil
-    }
-
-    private func checkStreamState(onStreamStateChange: @escaping (Bool) -> Void) {
-        guard let state = groupDefaults?.dictionary(forKey: "StreamState"),
-              let isActive = state["streamActive"] as? Bool else {
-            return
-        }
-
-        guard isActive != lastIsActive else { return }
-        lastIsActive = isActive
-        onStreamStateChange(isActive)
-    }
-}
-
 // MARK: - CMIO Sink Connector
 
 class CMIOSinkConnector {
@@ -179,9 +120,6 @@ class CMIOSinkConnector {
         return Double(_sessionSendCount - 1) / elapsedSec
     }
 
-    // Stream state monitoring
-    private let streamStateMonitor = StreamStateMonitor()
-
     // Property listener for automatic sink detection
     private var propertyListener: CMIOPropertyListener?
 
@@ -222,7 +160,6 @@ class CMIOSinkConnector {
         connectionRetryTimer = nil
         connectPollTimer?.invalidate()
         propertyListener?.stopListening()
-        streamStateMonitor.stopMonitoring()
     }
     
     // MARK: - Property Listener Setup
@@ -381,10 +318,7 @@ class CMIOSinkConnector {
         
         // Notify callbacks
         onConnectionStateChanged?(true)
-        
-        // Start monitoring stream state
-        startStreamStateMonitoring()
-        
+
         return true
     }
     
@@ -429,10 +363,7 @@ class CMIOSinkConnector {
         self.sinkStreamID = nil
         self.deviceID = nil
         self.isConnected = false
-        
-        // Stop monitoring
-        streamStateMonitor.stopMonitoring()
-        
+
         // Notify callbacks
         onConnectionStateChanged?(false)
         onSinkStreamAvailable?(false)
@@ -745,21 +676,6 @@ class CMIOSinkConnector {
                 }
                 
                 break
-            }
-        }
-    }
-    
-    // MARK: - Stream State Monitoring
-    
-    private func startStreamStateMonitoring() {
-        streamStateMonitor.startMonitoring { [weak self] isActive in
-            if isActive {
-                self?.logger.info("Extension signaled it needs frames")
-                // Notify CameraManager to handle the stream state change
-                NotificationCenter.default.post(name: NSNotification.Name("StreamStateChanged"), object: nil)
-            } else {
-                self?.logger.info("Extension signaled to stop frames")
-                NotificationCenter.default.post(name: NSNotification.Name("StreamStateChanged"), object: nil)
             }
         }
     }

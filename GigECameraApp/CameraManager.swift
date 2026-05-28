@@ -12,13 +12,6 @@ import os.log
 import OSLog
 import FramePipelineKit
 
-// UserDefaults extension for KVO
-extension UserDefaults {
-    @objc dynamic var StreamState: [String: Any]? {
-        return dictionary(forKey: "StreamState")
-    }
-}
-
 @MainActor
 class CameraManager: NSObject, ObservableObject {
     static let shared = CameraManager()
@@ -132,17 +125,6 @@ class CameraManager: NSObject, ObservableObject {
     // MARK: - Private Properties
     private let sinkConnector = CMIOSinkConnector()
     private var frameCount: Int = 0
-    private var streamStateObserver: NSKeyValueObservation?
-    /// Reentry guard for `handleStreamStateChange`. The handler clears the
-    /// `newClientConnected` flag by writing back to UserDefaults, which
-    /// synchronously re-triggers the same KVO observer on the same thread.
-    /// Without this guard, that reentry processes `streamActive==false` while
-    /// the outer call is mid-flight and the outer call then *also* falls
-    /// through to the same branch — producing the duplicate
-    /// "Extension stopped requesting frames"/"Stopping Aravis streaming" pair
-    /// seen in client-attach diagnostics.
-    private var isHandlingStreamState = false
-    private let appGroupDefaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera")
     private let networkMonitor = NetworkInterfaceMonitor()
     private var lastDiscoveryTime = Date.distantPast
 
@@ -215,7 +197,6 @@ class CameraManager: NSObject, ObservableObject {
     }
     
     deinit {
-        streamStateObserver?.invalidate()
         diagnosticsRefreshTimer?.invalidate()
         networkMonitor.stop()
     }
@@ -506,33 +487,6 @@ class CameraManager: NSObject, ObservableObject {
             name: NSNotification.Name("TriggerFrameSenderConnection"),
             object: nil
         )
-        
-        // Monitor App Group UserDefaults for stream state changes.
-        //
-        // We deliberately rely on KVO alone here. An earlier
-        // `UserDefaults.didChangeNotification` "backup" observer fired on every
-        // local UserDefaults write (including unrelated keys like
-        // `SelectedFormatWidth`), which produced spurious extra invocations of
-        // this handler and helped duplicate the stream-stop log pair seen in
-        // diagnostics. `didChangeNotification` does not deliver cross-process
-        // changes anyway, so it added noise without adding signal.
-        //
-        // The KVO closure hops to the main queue explicitly. Cross-process
-        // KVO delivery for App Group UserDefaults can land on a CFPrefs
-        // background thread, and `handleStreamStateChange` mutates
-        // `@MainActor`-isolated state (the `isHandlingStreamState` reentry
-        // guard and `@Published` properties on the manager). Forcing the
-        // main hop both satisfies isolation and makes the reentry guard
-        // single-threaded.
-        if let defaults = appGroupDefaults {
-            streamStateObserver = defaults.observe(\.StreamState, options: [.new, .initial]) { [weak self] _, _ in
-                DispatchQueue.main.async {
-                    self?.handleStreamStateChange()
-                }
-            }
-
-            handleStreamStateChange()
-        }
     }
     
     @objc private func handleCameraConnection(_ notification: Notification) {
@@ -558,16 +512,6 @@ class CameraManager: NSObject, ObservableObject {
             // Only update selectedCameraId if it's different to avoid triggering reconnection
             if selectedCameraId != camera.deviceId {
                 selectedCameraId = camera.deviceId
-            }
-            
-            // Auto-start streaming if connected but not streaming (producer model)
-            if !gigEManager.isStreaming {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    if gigEManager.isConnected && !gigEManager.isStreaming {
-                        self.logger.info("Auto-starting streaming on state change (producer model)...")
-                        gigEManager.startStreaming()
-                    }
-                }
             }
         } else {
             isConnected = false
@@ -596,102 +540,6 @@ class CameraManager: NSObject, ObservableObject {
         if let userInfo = notification.userInfo,
            let camera = userInfo["camera"] as? AravisCamera {
             logger.error("Failed to connect to: \(camera.modelName)")
-        }
-    }
-    
-    @objc private func handleStreamStateChange() {
-        // Reentry guard. Clearing `newClientConnected` below re-triggers the
-        // KVO observer synchronously; without this, the reentrant call would
-        // process `streamActive==false` and then the outer call would *also*
-        // fall through to the same branch, logging the stop pair twice.
-        guard !isHandlingStreamState else { return }
-        isHandlingStreamState = true
-        defer { isHandlingStreamState = false }
-
-        // Check if extension is requesting frames
-        guard let defaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera"),
-              let state = defaults.dictionary(forKey: "StreamState") else {
-            return
-        }
-
-        // Check for new client connection
-        if let newClientConnected = state["newClientConnected"] as? Bool, newClientConnected {
-            logger.info("New client connected - restarting camera stream to ensure frames flow")
-
-            // Clear the flag
-            var updatedState = state
-            updatedState["newClientConnected"] = false
-            defaults.set(updatedState, forKey: "StreamState")
-            defaults.synchronize()
-
-            // If camera is connected, ensure sink connection and restart streaming
-            if isConnected {
-                let gigEManager = GigECameraManager.shared
-
-                // First ensure sink is connected
-                if !isFrameSenderConnected {
-                    logger.info("New client connected but sink not ready - reconnecting sink first...")
-                    sinkConnector.disconnect()
-                    let connected = sinkConnector.connect()
-                    logger.info("Sink reconnection attempt returned: \(connected)")
-
-                    // Give sink time to connect before starting stream
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        if self.isFrameSenderConnected {
-                            self.logger.info("Sink connected, starting stream for new client...")
-                            gigEManager.startStreaming()
-                        } else {
-                            self.logger.warning("Sink still not connected after reconnection attempt")
-                            // Try streaming anyway
-                            gigEManager.startStreaming()
-                        }
-                    }
-                } else {
-                    // Sink already connected, just restart streaming
-                    if gigEManager.isStreaming {
-                        logger.info("Stopping current stream...")
-                        gigEManager.stopStreaming()
-
-                        // Small delay before restarting
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            self.logger.info("Restarting stream for new client...")
-                            gigEManager.startStreaming()
-                        }
-                    } else {
-                        logger.info("Starting stream for new client...")
-                        gigEManager.startStreaming()
-                    }
-                }
-            }
-
-            // Don't fall through to the streamActive check on the same call.
-            // The new-client branch already orchestrates its own stop/restart;
-            // processing `streamActive==false` here would issue a redundant
-            // `stopStreaming()` and double-log "Extension stopped requesting
-            // frames" / "Stopping Aravis streaming". A later KVO fire driven
-            // by an actual `streamActive` write will pick that up.
-            return
-        }
-
-        // Check if streaming is active
-        if let isActive = state["streamActive"] as? Bool {
-            if isActive {
-                logger.info("Extension requesting frames")
-                
-                // The property listener will handle sink connection automatically
-                // We just need to ensure Aravis is streaming
-                if isConnected && !GigECameraManager.shared.isStreaming {
-                    logger.info("Starting Aravis streaming in response to extension request")
-                    GigECameraManager.shared.startStreaming()
-                }
-            } else {
-                logger.info("Extension stopped requesting frames")
-                // Optionally stop streaming
-                if GigECameraManager.shared.isStreaming {
-                    logger.info("Stopping Aravis streaming")
-                    GigECameraManager.shared.stopStreaming()
-                }
-            }
         }
     }
     
@@ -740,13 +588,7 @@ class CameraManager: NSObject, ObservableObject {
     // MARK: - Public Methods for Frame Sender
     func retryFrameSenderConnection() {
         logger.info("Retrying CMIO sink connection...")
-
-        // Drop the current handle and reconnect. `connect()` polls discovery
-        // until the sink is found and attaches synchronously, so the user's
-        // click takes effect immediately even when no property-changed
-        // callback would otherwise fire.
-        sinkConnector.disconnect()
-        _ = sinkConnector.connect()
+        reconnectSink()
     }
     
     func testSinkStreamConnection() {  // Keep method name for compatibility
@@ -823,6 +665,19 @@ class CameraManager: NSObject, ObservableObject {
         // The actual cleanup is handled by the CameraPreviewSection's onDisappear
     }
     
+    /// The single deterministic sink reconnect path. Used for in-app lifecycle
+    /// events (camera switch, stop/start). No watchdog calls this — it is invoked
+    /// only from explicit user/lifecycle actions. Order matters: stop capture,
+    /// release the sink, then reconnect.
+    func reconnectSink() {
+        logger.info("Reconnecting sink (deterministic path)")
+        if GigECameraManager.shared.isStreaming {
+            GigECameraManager.shared.stopStreaming()
+        }
+        sinkConnector.disconnect()
+        _ = sinkConnector.connect()  // connect() polls until the device is reachable
+    }
+
     // MARK: - Frame Handler Setup
     private func setupFrameHandler() {
         // Stream consumer: runs on GigECameraManager.streamQueue (background).
@@ -891,34 +746,15 @@ class CameraManager: NSObject, ObservableObject {
     }
     
     private func setupSinkConnectorCallbacks() {
-        // Called when sink stream becomes available
-        sinkConnector.onSinkStreamAvailable = { [weak self] available in
-            guard let self = self else { return }
-
-            self.logger.info("Sink stream availability changed: \(available)")
-
-            if available && self.isConnected && !GigECameraManager.shared.isStreaming {
-                self.logger.info("Sink stream available - starting Aravis streaming automatically")
-                GigECameraManager.shared.startStreaming()
-            }
-        }
-
-        // Called when connection state changes
         sinkConnector.onConnectionStateChanged = { [weak self] connected in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-
                 self.isFrameSenderConnected = connected
-
                 if connected {
-                    self.logger.info("✅ Sink connector connected via property listener callback!")
-
-                    // Start Aravis streaming if camera is connected but not streaming.
-                    // The manifest is started in startStreaming() (tied to camera
-                    // streaming, not sink connection) so an audit trail exists for
-                    // every frame the camera produces.
+                    self.logger.info("✅ Sink connector connected")
+                    // Camera capture is continuous; if the camera is connected
+                    // but not yet streaming, start it now.
                     if self.isConnected && !GigECameraManager.shared.isStreaming {
-                        self.logger.info("Starting Aravis streaming after sink connection")
                         GigECameraManager.shared.startStreaming()
                     }
                 } else {
@@ -926,6 +762,7 @@ class CameraManager: NSObject, ObservableObject {
                 }
             }
         }
+        // onSinkStreamAvailable is no longer used to drive streaming; leave it unset.
     }
 
     func getPerformanceMetrics() -> (fps: Double, framesTotal: UInt64, framesDropped: UInt64) {

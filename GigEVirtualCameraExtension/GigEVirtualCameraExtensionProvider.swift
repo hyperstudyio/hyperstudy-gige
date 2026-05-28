@@ -10,65 +10,6 @@ import CoreMediaIO
 import IOKit.audio
 import os.log
 
-// MARK: - Stream State Coordinator
-
-/// Writes to the shared `StreamState` dict that the app observes.
-///
-/// The mutation logic is duplicated in `FramePipelineKit/StreamStateMutation.swift`
-/// so it can be unit-tested. Keep both in sync if you change one.
-///
-/// Why merge instead of replace: source.startStream sets
-/// `newClientConnected = true`, then immediately calls
-/// `deviceSource.startStreaming()` which may call `signalNeedFrames()`. The
-/// previous implementation replaced the entire dict in `signalNeedFrames`,
-/// erasing `newClientConnected` before the app could observe it. That broke
-/// the recovery path the app relies on when its sink is disconnected.
-class StreamStateCoordinator {
-    private let logger = Logger(subsystem: "com.lukechang.GigEVirtualCamera.Extension", category: "StreamState")
-    private let appGroupID = "group.S368GH6KF7.com.lukechang.GigEVirtualCamera"
-    static let stateKey = "StreamState"
-
-    private var groupDefaults: UserDefaults? {
-        UserDefaults(suiteName: appGroupID)
-    }
-
-    func signalNeedFrames() {
-        guard let defaults = groupDefaults else {
-            logger.error("Failed to access App Group UserDefaults")
-            SharedExtensionLog.shared.write(level: .error, category: "Ext.StreamState",
-                message: "Failed to access App Group UserDefaults in signalNeedFrames")
-            return
-        }
-        let existing = defaults.dictionary(forKey: Self.stateKey) ?? [:]
-        var merged = existing
-        merged["streamActive"] = true
-        merged["timestamp"] = Date().timeIntervalSince1970
-        merged["pid"] = ProcessInfo.processInfo.processIdentifier
-        defaults.set(merged, forKey: Self.stateKey)
-        defaults.synchronize()
-
-        logger.info("Signaled app to start sending frames")
-        SharedExtensionLog.shared.write(level: .notice, category: "Ext.StreamState",
-            message: "Wrote streamActive=true to app group; awaiting app sink attach")
-    }
-
-    /// Clears the active flag but preserves `newClientConnected` and other
-    /// transient flags the app may still need to observe. Previously this
-    /// removed the entire dict, which caused the app's handler to early-return
-    /// (no observable transition) and silently leave Aravis streaming.
-    func signalStreamStopped() {
-        guard let defaults = groupDefaults else { return }
-        let existing = defaults.dictionary(forKey: Self.stateKey) ?? [:]
-        var merged = existing
-        merged["streamActive"] = false
-        merged["timestamp"] = Date().timeIntervalSince1970
-        defaults.set(merged, forKey: Self.stateKey)
-        defaults.synchronize()
-
-        logger.info("Signaled app to stop sending frames")
-    }
-}
-
 // MARK: - Sink Stream Source
 
 class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
@@ -425,21 +366,6 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
             throw NSError(domain: "GigEVirtualCamera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid device source"])
         }
         
-        // Write debug marker to UserDefaults
-        if let groupDefaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera") {
-            groupDefaults.set("Source stream started at \(Date())", forKey: "Debug_SourceStreamStarted")
-            
-            // IMPORTANT: Notify app that a new client has connected
-            // This will trigger the app to restart camera streaming if needed
-            var streamState = groupDefaults.dictionary(forKey: "StreamState") ?? [:]
-            streamState["newClientConnected"] = true
-            streamState["clientConnectedTime"] = Date().timeIntervalSince1970
-            groupDefaults.set(streamState, forKey: "StreamState")
-            groupDefaults.synchronize()
-            
-            NSLog("🎬🎬🎬 Notified app about new client connection")
-        }
-        
         NSLog("🎬🎬🎬 SOURCE STREAM STARTING - Sink active: \(deviceSource.isSinking)")
         NSLog("🎬🎬🎬 Current streamingCounter BEFORE increment: \(deviceSource.streamingCounter)")
         logger.info("🟢 Starting source stream")
@@ -703,12 +629,8 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
 
     // Stream state. CMIO can invoke startStream/stopStream on any thread, and
     // the source-stream and sink-stream lifecycles can interleave (consumer
-    // connects while app is in the middle of attaching its sink, etc.). The
-    // "first-client" and "last-client" branches below relied on bare reads of
-    // these counters, which produced stale-state windows where the extension
-    // either over-signaled the app (multiple signalNeedFrames calls per
-    // consumer) or under-signaled (consumer fully attached without the app
-    // ever being woken). All mutations and decisions happen under stateLock.
+    // connects while app is in the middle of attaching its sink, etc.). All
+    // mutations and decisions happen under stateLock.
     private var _streamingCounter = 0
     private var _isSinking = false
     private var stateLock = os_unfair_lock()
@@ -733,9 +655,6 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
         return _streamingCounter
     }
 
-    // App coordination
-    private let streamStateCoordinator = StreamStateCoordinator()
-    
     init(localizedName: String) {
         super.init()
         
@@ -837,32 +756,15 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
     
     // Called by source stream when client starts watching
     func startStreaming() {
-        // Decide whether we are the first client and whether the sink is
-        // already serving frames — atomically, so a concurrent consumer
-        // attach/detach can't make us double-signal or skip signaling.
         os_unfair_lock_lock(&stateLock)
         _streamingCounter += 1
         let counter = _streamingCounter
         let sinking = _isSinking
-        let shouldSignalNeedFrames = (counter == 1) && !sinking
         os_unfair_lock_unlock(&stateLock)
 
         logger.info("🎬 Source stream started. Client count: \(counter), sink: \(sinking)")
         SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
             message: "🎬 Source stream started (clients: \(counter), sink active: \(sinking))")
-
-        // Notify outside the lock — signalNeedFrames touches UserDefaults
-        // and shouldn't hold the lock across an IPC-style write.
-        if shouldSignalNeedFrames {
-            logger.info("📢 Signaling app to start sending frames")
-            SharedExtensionLog.shared.write(level: .notice, category: "Ext.Device",
-                message: "📢 Signaling app to start sending frames (newClientConnected=true)")
-            streamStateCoordinator.signalNeedFrames()
-        } else if counter == 1 && sinking {
-            logger.info("✅ Sink already active - frames should be flowing")
-            SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
-                message: "✅ Sink already active - frames should be flowing")
-        }
     }
 
     // Called by source stream when client stops watching
@@ -872,18 +774,11 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
             _streamingCounter -= 1
         }
         let counter = _streamingCounter
-        let shouldSignalStopped = (counter == 0)
         os_unfair_lock_unlock(&stateLock)
 
         logger.info("Source stream stopped. Client count: \(counter)")
         SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
             message: "Source stream stopped (clients remaining: \(counter))")
-
-        if shouldSignalStopped {
-            SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
-                message: "Signaling app: streamActive=false (last client gone)")
-            streamStateCoordinator.signalStreamStopped()
-        }
     }
 
     // Called by sink stream when app starts sending

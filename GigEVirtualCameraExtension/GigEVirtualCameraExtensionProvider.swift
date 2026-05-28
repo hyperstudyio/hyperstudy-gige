@@ -525,6 +525,11 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
 
         let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 
+        // Single-producer invariant: while real frames flow, the idle watchdog
+        // stays silent (it self-suppresses on fresh lastRealFrameUptimeNs), so
+        // this clamp is a safety net over an already-monotonic timeline rather
+        // than an arbiter between racing producers. Browsers freeze on a
+        // non-monotonic hostTime, so the clamp stays as belt-and-suspenders.
         os_unfair_lock_lock(&sendLock)
         // Clamp to strictly-increasing. Bump by 1 ns rather than dropping;
         // ns-level jitter is imperceptible to video and a dropped frame is

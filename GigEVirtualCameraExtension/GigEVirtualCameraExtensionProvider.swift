@@ -191,12 +191,6 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
         qos: .userInteractive
     )
 
-    // Error budget. CMIO can deliver many error callbacks in quick succession
-    // (e.g., the app's client disappeared). Without a budget the .asyncAfter
-    // retry on every error degenerates into a self-perpetuating loop.
-    private var consecutiveErrorCount = 0
-    private static let maxConsecutiveErrors = 8
-
     // One-shot gate for the "first frame consumed" log. Reset in `subscribe()`
     // so each new sink subscription emits the notice exactly once. The
     // previous gate (`sequenceNumber == 0`) misfired on every frame because
@@ -232,26 +226,27 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                 message: "Already subscribing - skipping duplicate subscription")
             return
         }
-        consecutiveErrorCount = 0
         hasLoggedFirstFrame = false
 
         logger.info("🔵 Sink subscribing to consume buffers from client PID: \(client.pid)")
         SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
             message: "🔵 Sink subscribing to consume buffers (client PID \(client.pid))")
 
-        // Start consuming buffers - this will be called repeatedly by CMIO
-        scheduleConsumeNextBuffer(after: 0)
+        // Start consuming buffers — re-arms itself until stopStream().
+        rearmConsume(cushionMs: 0)
     }
 
-    /// Schedules a call to `consumeNextBuffer` on the consumer queue. Replaces
-    /// the previous synchronous recursion (stack growth) and per-call
-    /// `DispatchQueue.main.asyncAfter` (UI-thread starvation + runloop pin).
-    private func scheduleConsumeNextBuffer(after delay: TimeInterval) {
+    /// Re-arms the consume loop on the consumer queue. `cushionMs` adds a small
+    /// delay ONLY when the last read produced no buffer (empty queue or transient
+    /// error), preventing a hot spin without imposing a fixed frame-rate cap. On
+    /// the success path it re-arms immediately so the loop paces itself to the
+    /// camera's true delivery rate — the key fix for MRC lag/jitter.
+    private func rearmConsume(cushionMs: Int) {
         guard isStillSubscribing() else { return }
-        if delay <= 0 {
+        if cushionMs <= 0 {
             consumerQueue.async { [weak self] in self?.consumeNextBuffer() }
         } else {
-            consumerQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            consumerQueue.asyncAfter(deadline: .now() + .milliseconds(cushionMs)) { [weak self] in
                 self?.consumeNextBuffer()
             }
         }
@@ -260,42 +255,9 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
     private func consumeNextBuffer() {
         guard isStillSubscribing(), let client = self.client else { return }
 
-        stream.consumeSampleBuffer(from: client) { [weak self] (sampleBuffer, sequenceNumber, _, hasMoreSampleBuffers, error) in
+        stream.consumeSampleBuffer(from: client) { [weak self] (sampleBuffer, sequenceNumber, _, _, error) in
             guard let self = self else { return }
             guard self.isStillSubscribing() else { return }
-
-            if let error = error {
-                self.consecutiveErrorCount &+= 1
-                let count = self.consecutiveErrorCount
-                self.logger.error("❌ Error consuming sample buffer (#\(count)): \(error.localizedDescription)")
-                // Log every 1st/4th/8th error to the shared log (the full
-                // burst is in the unified log via os.log already); the
-                // shared log surfaces the cadence to the diagnostics drawer.
-                if count == 1 || count == 4 || count >= Self.maxConsecutiveErrors {
-                    SharedExtensionLog.shared.write(level: .error, category: "Ext.SinkStream",
-                        message: "❌ consumeSampleBuffer error #\(count): \(error.localizedDescription)")
-                }
-
-                if count >= Self.maxConsecutiveErrors {
-                    // The client connection is dead. Tear down the subscription
-                    // so the runloop is freed; CMIO will call stopStream when
-                    // the app's sink handle finally closes, or a fresh
-                    // startStream will reset everything.
-                    self.logger.error("Giving up after \(count) consecutive errors; stopping consumption")
-                    SharedExtensionLog.shared.write(level: .error, category: "Ext.SinkStream",
-                        message: "Giving up after \(count) consecutive errors; subscription torn down")
-                    _ = self.setSubscribing(false)
-                    return
-                }
-
-                // Exponential backoff: 100ms, 200ms, 400ms, ... up to ~2s.
-                let backoff = min(2.0, 0.1 * pow(2.0, Double(count - 1)))
-                self.scheduleConsumeNextBuffer(after: backoff)
-                return
-            }
-
-            // Successful read clears the error budget.
-            self.consecutiveErrorCount = 0
 
             if let sampleBuffer = sampleBuffer {
                 if !self.hasLoggedFirstFrame {
@@ -303,32 +265,32 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                     SharedExtensionLog.shared.write(level: .notice, category: "Ext.SinkStream",
                         message: "🎉 First frame consumed from sink")
                 }
-
-                if sequenceNumber % 300 == 0 {
-                    // Per-frame NSLog calls are synchronous IPC and were
-                    // costing ~150 calls/s at 30 fps. Sample once every 10
-                    // seconds instead.
-                    self.logger.info("Sink received frame #\(sequenceNumber)")
-                    if sequenceNumber > 0 {
-                        SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
-                            message: "Sink consumed frame #\(sequenceNumber)")
-                    }
+                // Sample the cadence to the shared log ~every 10s at 30fps.
+                if sequenceNumber > 0 && sequenceNumber % 300 == 0 {
+                    SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
+                        message: "Sink consumed frame #\(sequenceNumber)")
                 }
-
-                if let consumeCallback = self.consumeSampleBuffer {
-                    consumeCallback(sampleBuffer)
-                }
-
-                // Keep draining without growing the stack. Even when
-                // hasMoreSampleBuffers is true, we hop through the consumer
-                // queue rather than synchronously recursing inside CMIO's
-                // own callback frame (which previously risked stack growth
-                // proportional to the queue depth).
-                self.scheduleConsumeNextBuffer(after: hasMoreSampleBuffers ? 0 : 0.033)
-            } else {
-                // Queue empty — poll at ~30 fps.
-                self.scheduleConsumeNextBuffer(after: 0.033)
+                // Forward to the source stream (the device source's bridge
+                // closure decides, via consumer presence, whether send happens).
+                self.consumeSampleBuffer?(sampleBuffer)
+                // Success → re-arm immediately; self-pacing to delivery rate.
+                self.rearmConsume(cushionMs: 0)
+                return
             }
+
+            if let error = error {
+                // Transient (queue momentarily empty, client busy). DO NOT tear
+                // down — the reference never gives up here. Just re-arm after a
+                // small cushion so a burst of errors can't hot-spin the queue.
+                // The loop ends only when stopStream() flips the subscribing flag.
+                SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
+                    message: "consumeSampleBuffer transient (re-arming): \(error.localizedDescription)")
+                self.rearmConsume(cushionMs: 20)
+                return
+            }
+
+            // No buffer, no error → queue empty. Re-arm with a small cushion.
+            self.rearmConsume(cushionMs: 5)
         }
     }
 }

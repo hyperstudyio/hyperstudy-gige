@@ -148,12 +148,31 @@ class CameraManager: NSObject, ObservableObject {
     private var lastDiscoveryTime = Date.distantPast
 
     /// Stall watchdog. Ticks 2 Hz; flips `streamStalled` when no frame has been
-    /// sent in `streamStallTimeoutSec`. Detection-only: surfaces the banner so
-    /// the operator knows frames stopped, no destructive recovery action. The
-    /// previous automatic disconnect+rediscover ran during transient camera
-    /// glitches and made things worse — see the commit log.
+    /// sent in `streamStallTimeoutSec`. Detection-only for the *frame-gap*
+    /// failure mode (sink connected, frames briefly stopped). A *separate*
+    /// dead-sink path (`sinkDeadSinceUptimeNs` below) handles the case where
+    /// the sink itself is stuck disconnected — that one *does* trigger a
+    /// rediscovery, because the CMIO property listener doesn't always
+    /// deliver an attach callback and without manual intervention the app
+    /// stays disconnected indefinitely.
     private var streamStallWatchdog: Timer?
     private let streamStallTimeoutSec: Double = 2.0
+
+    /// CLOCK_UPTIME_RAW timestamp of when `isFrameSenderConnected` first went
+    /// false while streaming. Zero when the sink is connected. The watchdog
+    /// uses this to detect "stuck dead-sink": the property listener
+    /// occasionally misses the sink attach event, leaving the app
+    /// disconnected forever with frames being produced into a void. When
+    /// the gap exceeds `sinkDeadThresholdSec` AND we're outside the
+    /// disruption grace window, we fire `forceRediscovery` to manually
+    /// enumerate CMIO devices and reattach.
+    private var sinkDeadSinceUptimeNs: UInt64 = 0
+    private let sinkDeadThresholdSec: Double = 5.0
+    /// CLOCK_UPTIME_RAW timestamp of the last `forceRediscovery` attempt for
+    /// a dead sink. Throttled with `sinkRecoveryCooldownSec` so we don't
+    /// hammer the CMIO stack with retries when rediscovery keeps failing.
+    private var lastSinkRecoveryAttemptUptimeNs: UInt64 = 0
+    private let sinkRecoveryCooldownSec: Double = 15.0
 
     /// CLOCK_UPTIME_RAW timestamp of the most recent known frame-pipeline
     /// disruption — a sink transition, a network reconfiguration, a
@@ -1031,8 +1050,55 @@ class CameraManager: NSObject, ObservableObject {
         guard isStreaming else {
             if streamStalled { streamStalled = false }
             if streamStallDurationSec != 0 { streamStallDurationSec = 0 }
+            sinkDeadSinceUptimeNs = 0
             return
         }
+
+        // Dead-sink detection path. The CMIO property listener occasionally
+        // misses the sink-attach callback (observed on v1.1.15 with the MRC
+        // camera: 3+ minutes of "Cannot send frame - not connected to sink"
+        // with no `Sink stream availability changed` log). The frame-gap
+        // stall watchdog below can't detect this because `lastSendNs` is
+        // still 0 in that state — no frame ever made it through, so the
+        // guard returns and the operator sees no banner.
+        //
+        // Strategy: if `isFrameSenderConnected` has been false for longer
+        // than `sinkDeadThresholdSec` AND we're outside the disruption
+        // grace window (so normal teardown/reattach cycles don't trigger),
+        // force a manual rediscovery. Throttled by
+        // `sinkRecoveryCooldownSec`.
+        if !isFrameSenderConnected {
+            if sinkDeadSinceUptimeNs == 0 {
+                sinkDeadSinceUptimeNs = nowUptimeNs
+            }
+            let secDead = Double(nowUptimeNs &- sinkDeadSinceUptimeNs) / 1_000_000_000.0
+            let withinDisruptionGrace: Bool = {
+                guard lastPipelineDisruptionUptimeNs != 0 else { return false }
+                let sec = Double(nowUptimeNs &- lastPipelineDisruptionUptimeNs) / 1_000_000_000.0
+                return sec < pipelineGraceSec
+            }()
+            if secDead >= sinkDeadThresholdSec && !withinDisruptionGrace {
+                let secSinceLastAttempt = lastSinkRecoveryAttemptUptimeNs == 0
+                    ? Double.greatestFiniteMagnitude
+                    : Double(nowUptimeNs &- lastSinkRecoveryAttemptUptimeNs) / 1_000_000_000.0
+                if secSinceLastAttempt >= sinkRecoveryCooldownSec {
+                    lastSinkRecoveryAttemptUptimeNs = nowUptimeNs
+                    let rounded = (secDead * 10).rounded() / 10
+                    logger.warning("⚠️ Sink disconnected for \(rounded)s while streaming — forcing rediscovery")
+                    // Surface the banner so the operator knows something is
+                    // wrong and the system isn't silently dropping frames.
+                    streamStalled = true
+                    streamStallDurationSec = secDead
+                    sinkConnector.disconnect()
+                    sinkConnector.forceRediscovery()
+                }
+            }
+            return
+        }
+        // Sink is connected; clear dead-sink tracking. Don't reset the
+        // last-attempt cooldown — if recovery just succeeded we don't want
+        // to immediately re-fire on the next disconnect.
+        sinkDeadSinceUptimeNs = 0
 
         // Edge case: no frames have ever been sent. Don't flag as a stall until
         // the user has had a chance to actually start the stream.

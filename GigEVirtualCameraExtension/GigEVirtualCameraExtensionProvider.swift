@@ -211,8 +211,9 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                     SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
                         message: "Sink consumed frame #\(sequenceNumber)")
                 }
-                // Forward to the source stream (the device source's bridge
-                // closure decides, via consumer presence, whether send happens).
+                // Forward to the source stream via the device source's bridge
+                // closure (set in startSinkStreaming). Forwarding is unconditional;
+                // a source send with no consumer attached is harmless.
                 self.consumeSampleBuffer?(sampleBuffer)
                 // Success → re-arm immediately; self-pacing to delivery rate.
                 self.rearmConsume(cushionMs: 0)

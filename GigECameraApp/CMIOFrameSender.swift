@@ -74,31 +74,12 @@ class CMIOSinkConnector {
 
     private var livenessLock = os_unfair_lock()
 
-    /// Thread-safe accessor for the watchdog. Returns 0 if no frame has ever
-    /// been sent through this connector.
-    var lastSuccessfulSendUptimeNs: UInt64 {
-        os_unfair_lock_lock(&livenessLock)
-        defer { os_unfair_lock_unlock(&livenessLock) }
-        return _lastSuccessfulSendUptimeNs
-    }
-
     /// Total number of times the PTS monotonicity guard had to nudge a
     /// timestamp forward. Should stay at 0 in healthy operation.
     var nonMonotonicNudges: UInt64 {
         os_unfair_lock_lock(&livenessLock)
         defer { os_unfair_lock_unlock(&livenessLock) }
         return _nonMonotonicNudges
-    }
-
-    /// Successful enqueues since the current sink session started. The stall
-    /// watchdog only flags a stall once this exceeds a threshold roughly an
-    /// order of magnitude larger than the sink queue's capacity, so initial
-    /// queue-fill (with no consumer attached) doesn't get reported as a
-    /// stall — it's just an idle state, no consumer is reading the camera.
-    var sessionSendCount: UInt64 {
-        os_unfair_lock_lock(&livenessLock)
-        defer { os_unfair_lock_unlock(&livenessLock) }
-        return _sessionSendCount
     }
 
     /// Average measured fps over the current sink session, or `nil` if no

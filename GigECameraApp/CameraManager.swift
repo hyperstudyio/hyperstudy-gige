@@ -701,47 +701,13 @@ class CameraManager: NSObject, ObservableObject {
             DispatchQueue.main.async { self?.ptsNudgeCount = self?.sinkConnector.nonMonotonicNudges ?? 0 }
         }
 
-        // Start the connection process
+        // Start the connection process. connect() internally starts a 1 Hz
+        // startConnectPolling loop that retries discovery until the sink is
+        // found — no manual backoff needed here.
         logger.info("Starting sink connector connection...")
         let connected = sinkConnector.connect()
         logger.info("Initial sink connector connect returned: \(connected)")
-        
-        // If initial connection fails, set up automatic retry
-        if !connected {
-            logger.info("Initial sink connection failed - setting up automatic retry...")
-            var retryCount = 0
-            let maxRetries = 5
-            
-            func attemptConnection() {
-                guard retryCount < maxRetries else {
-                    self.logger.warning("Max sink connection retries reached (\(maxRetries))")
-                    return
-                }
-                
-                retryCount += 1
-                DispatchQueue.main.asyncAfter(deadline: .now() + Double(retryCount) * 1.5) { [weak self] in
-                    guard let self = self else { return }
-                    
-                    // Don't retry if already connected
-                    guard !self.isFrameSenderConnected else {
-                        self.logger.info("Sink already connected, stopping retry")
-                        return
-                    }
-                    
-                    self.logger.info("Sink connection retry \(retryCount)/\(maxRetries)...")
-                    let retryConnected = self.sinkConnector.connect()
-                    
-                    if retryConnected {
-                        self.logger.info("✅ Sink connected on retry \(retryCount)")
-                    } else if retryCount < maxRetries {
-                        attemptConnection() // Try again
-                    }
-                }
-            }
-            
-            attemptConnection()
-        }
-        
+
         logger.info("Frame handler setup complete - waiting for sink stream discovery")
     }
     
@@ -805,15 +771,8 @@ class CameraManager: NSObject, ObservableObject {
             groupDefaults.set(height, forKey: "SelectedFormatHeight")
             groupDefaults.set(fps, forKey: "SelectedFormatFPS")
             groupDefaults.synchronize()
-            
+
             logger.info("Updated format to \(width)×\(height) @ \(fps)fps")
-            
-            // Notify extension about format change
-            var streamState = groupDefaults.dictionary(forKey: "StreamState") ?? [:]
-            streamState["formatChanged"] = true
-            streamState["formatChangeTime"] = Date().timeIntervalSince1970
-            groupDefaults.set(streamState, forKey: "StreamState")
-            groupDefaults.synchronize()
         }
         
         // Apply resolution to camera if connected.

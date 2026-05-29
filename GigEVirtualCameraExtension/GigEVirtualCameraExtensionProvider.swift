@@ -271,6 +271,11 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
     private var lastSentHostTimeNs: UInt64 = 0
     private var sendLock = os_unfair_lock()
 
+    // Total frames handed to stream.send() this process lifetime. Logged
+    // periodically (outside the lock) so the source-forward path — previously
+    // invisible in diagnostics — is observable.
+    private var sourceSendCount: UInt64 = 0
+
     // Keep reference to last frame for new clients
     private var lastReceivedFrame: CMSampleBuffer?
     private let frameQueue = DispatchQueue(label: "com.lukechang.lastframe", qos: .userInteractive)
@@ -450,22 +455,38 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
             }
         }
 
-        let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        // Derive the delivery host time from the buffer's OWN presentation
+        // timestamp so the embedded PTS and the CMIO delivery time share a
+        // single clock — exactly what the canonical reference does. Using
+        // "now" here made the two diverge by the capture→sink→consume pipeline
+        // latency; that divergence desyncs a consumer's clock and freezes the
+        // picture after a few seconds (reproduced on FaceTime AND the browser).
+        // The app builds PTS with a 1e9 timescale (nanoseconds), so recover ns
+        // exactly; fall back to the host clock only if the PTS is invalid.
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let candidateNs: UInt64
+        if pts.isValid && pts.value > 0 {
+            candidateNs = pts.timescale == 1_000_000_000
+                ? UInt64(bitPattern: pts.value)
+                : UInt64(max(0, CMTimeGetSeconds(pts)) * Double(NSEC_PER_SEC))
+        } else {
+            candidateNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        }
 
         // Single-producer invariant: while real frames flow, the idle watchdog
         // stays silent (it self-suppresses on fresh lastRealFrameUptimeNs), so
         // this clamp is a safety net over an already-monotonic timeline rather
-        // than an arbiter between racing producers. Browsers freeze on a
+        // than an arbiter between racing producers. Consumers freeze on a
         // non-monotonic hostTime, so the clamp stays as belt-and-suspenders.
         os_unfair_lock_lock(&sendLock)
         // Clamp to strictly-increasing. Bump by 1 ns rather than dropping;
         // ns-level jitter is imperceptible to video and a dropped frame is
         // worse than a 1 ns nudge. See MonotonicHostClock for tested logic.
         let hostTimeNs: UInt64
-        if nowNs <= lastSentHostTimeNs {
+        if candidateNs <= lastSentHostTimeNs {
             hostTimeNs = lastSentHostTimeNs &+ 1
         } else {
-            hostTimeNs = nowNs
+            hostTimeNs = candidateNs
         }
         lastSentHostTimeNs = hostTimeNs
         if !isDefault {
@@ -477,7 +498,19 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
             discontinuity: [],
             hostTimeInNanoseconds: hostTimeNs
         )
+        sourceSendCount &+= 1
+        let count = sourceSendCount
         os_unfair_lock_unlock(&sendLock)
+
+        // Instrumentation (outside the lock to avoid per-frame IPC churn): the
+        // forward path had zero visibility. Sample ~every 150 frames so an
+        // export shows frames actually reaching the source stream and the
+        // host-time they were sent with — enough to spot a forward stall or a
+        // timestamp anomaly without flooding the shared log.
+        if count % 150 == 0 {
+            SharedExtensionLog.shared.write(level: .info, category: "Ext.SourceStream",
+                message: "→ forwarded \(count) frames to source (hostTimeNs=\(hostTimeNs), default=\(isDefault))")
+        }
     }
     
     private func createDefaultPixelBuffer() {

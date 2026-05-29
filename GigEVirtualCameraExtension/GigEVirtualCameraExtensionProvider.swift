@@ -10,65 +10,6 @@ import CoreMediaIO
 import IOKit.audio
 import os.log
 
-// MARK: - Stream State Coordinator
-
-/// Writes to the shared `StreamState` dict that the app observes.
-///
-/// The mutation logic is duplicated in `FramePipelineKit/StreamStateMutation.swift`
-/// so it can be unit-tested. Keep both in sync if you change one.
-///
-/// Why merge instead of replace: source.startStream sets
-/// `newClientConnected = true`, then immediately calls
-/// `deviceSource.startStreaming()` which may call `signalNeedFrames()`. The
-/// previous implementation replaced the entire dict in `signalNeedFrames`,
-/// erasing `newClientConnected` before the app could observe it. That broke
-/// the recovery path the app relies on when its sink is disconnected.
-class StreamStateCoordinator {
-    private let logger = Logger(subsystem: "com.lukechang.GigEVirtualCamera.Extension", category: "StreamState")
-    private let appGroupID = "group.S368GH6KF7.com.lukechang.GigEVirtualCamera"
-    static let stateKey = "StreamState"
-
-    private var groupDefaults: UserDefaults? {
-        UserDefaults(suiteName: appGroupID)
-    }
-
-    func signalNeedFrames() {
-        guard let defaults = groupDefaults else {
-            logger.error("Failed to access App Group UserDefaults")
-            SharedExtensionLog.shared.write(level: .error, category: "Ext.StreamState",
-                message: "Failed to access App Group UserDefaults in signalNeedFrames")
-            return
-        }
-        let existing = defaults.dictionary(forKey: Self.stateKey) ?? [:]
-        var merged = existing
-        merged["streamActive"] = true
-        merged["timestamp"] = Date().timeIntervalSince1970
-        merged["pid"] = ProcessInfo.processInfo.processIdentifier
-        defaults.set(merged, forKey: Self.stateKey)
-        defaults.synchronize()
-
-        logger.info("Signaled app to start sending frames")
-        SharedExtensionLog.shared.write(level: .notice, category: "Ext.StreamState",
-            message: "Wrote streamActive=true to app group; awaiting app sink attach")
-    }
-
-    /// Clears the active flag but preserves `newClientConnected` and other
-    /// transient flags the app may still need to observe. Previously this
-    /// removed the entire dict, which caused the app's handler to early-return
-    /// (no observable transition) and silently leave Aravis streaming.
-    func signalStreamStopped() {
-        guard let defaults = groupDefaults else { return }
-        let existing = defaults.dictionary(forKey: Self.stateKey) ?? [:]
-        var merged = existing
-        merged["streamActive"] = false
-        merged["timestamp"] = Date().timeIntervalSince1970
-        defaults.set(merged, forKey: Self.stateKey)
-        defaults.synchronize()
-
-        logger.info("Signaled app to stop sending frames")
-    }
-}
-
 // MARK: - Sink Stream Source
 
 class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
@@ -191,12 +132,6 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
         qos: .userInteractive
     )
 
-    // Error budget. CMIO can deliver many error callbacks in quick succession
-    // (e.g., the app's client disappeared). Without a budget the .asyncAfter
-    // retry on every error degenerates into a self-perpetuating loop.
-    private var consecutiveErrorCount = 0
-    private static let maxConsecutiveErrors = 8
-
     // One-shot gate for the "first frame consumed" log. Reset in `subscribe()`
     // so each new sink subscription emits the notice exactly once. The
     // previous gate (`sequenceNumber == 0`) misfired on every frame because
@@ -232,26 +167,27 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                 message: "Already subscribing - skipping duplicate subscription")
             return
         }
-        consecutiveErrorCount = 0
         hasLoggedFirstFrame = false
 
         logger.info("🔵 Sink subscribing to consume buffers from client PID: \(client.pid)")
         SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
             message: "🔵 Sink subscribing to consume buffers (client PID \(client.pid))")
 
-        // Start consuming buffers - this will be called repeatedly by CMIO
-        scheduleConsumeNextBuffer(after: 0)
+        // Start consuming buffers — re-arms itself until stopStream().
+        rearmConsume(cushionMs: 0)
     }
 
-    /// Schedules a call to `consumeNextBuffer` on the consumer queue. Replaces
-    /// the previous synchronous recursion (stack growth) and per-call
-    /// `DispatchQueue.main.asyncAfter` (UI-thread starvation + runloop pin).
-    private func scheduleConsumeNextBuffer(after delay: TimeInterval) {
+    /// Re-arms the consume loop on the consumer queue. `cushionMs` adds a small
+    /// delay ONLY when the last read produced no buffer (empty queue or transient
+    /// error), preventing a hot spin without imposing a fixed frame-rate cap. On
+    /// the success path it re-arms immediately so the loop paces itself to the
+    /// camera's true delivery rate — the key fix for MRC lag/jitter.
+    private func rearmConsume(cushionMs: Int) {
         guard isStillSubscribing() else { return }
-        if delay <= 0 {
+        if cushionMs <= 0 {
             consumerQueue.async { [weak self] in self?.consumeNextBuffer() }
         } else {
-            consumerQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            consumerQueue.asyncAfter(deadline: .now() + .milliseconds(cushionMs)) { [weak self] in
                 self?.consumeNextBuffer()
             }
         }
@@ -260,42 +196,9 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
     private func consumeNextBuffer() {
         guard isStillSubscribing(), let client = self.client else { return }
 
-        stream.consumeSampleBuffer(from: client) { [weak self] (sampleBuffer, sequenceNumber, _, hasMoreSampleBuffers, error) in
+        stream.consumeSampleBuffer(from: client) { [weak self] (sampleBuffer, sequenceNumber, _, _, error) in
             guard let self = self else { return }
             guard self.isStillSubscribing() else { return }
-
-            if let error = error {
-                self.consecutiveErrorCount &+= 1
-                let count = self.consecutiveErrorCount
-                self.logger.error("❌ Error consuming sample buffer (#\(count)): \(error.localizedDescription)")
-                // Log every 1st/4th/8th error to the shared log (the full
-                // burst is in the unified log via os.log already); the
-                // shared log surfaces the cadence to the diagnostics drawer.
-                if count == 1 || count == 4 || count >= Self.maxConsecutiveErrors {
-                    SharedExtensionLog.shared.write(level: .error, category: "Ext.SinkStream",
-                        message: "❌ consumeSampleBuffer error #\(count): \(error.localizedDescription)")
-                }
-
-                if count >= Self.maxConsecutiveErrors {
-                    // The client connection is dead. Tear down the subscription
-                    // so the runloop is freed; CMIO will call stopStream when
-                    // the app's sink handle finally closes, or a fresh
-                    // startStream will reset everything.
-                    self.logger.error("Giving up after \(count) consecutive errors; stopping consumption")
-                    SharedExtensionLog.shared.write(level: .error, category: "Ext.SinkStream",
-                        message: "Giving up after \(count) consecutive errors; subscription torn down")
-                    _ = self.setSubscribing(false)
-                    return
-                }
-
-                // Exponential backoff: 100ms, 200ms, 400ms, ... up to ~2s.
-                let backoff = min(2.0, 0.1 * pow(2.0, Double(count - 1)))
-                self.scheduleConsumeNextBuffer(after: backoff)
-                return
-            }
-
-            // Successful read clears the error budget.
-            self.consecutiveErrorCount = 0
 
             if let sampleBuffer = sampleBuffer {
                 if !self.hasLoggedFirstFrame {
@@ -303,32 +206,33 @@ class SinkStreamSource: NSObject, CMIOExtensionStreamSource {
                     SharedExtensionLog.shared.write(level: .notice, category: "Ext.SinkStream",
                         message: "🎉 First frame consumed from sink")
                 }
-
-                if sequenceNumber % 300 == 0 {
-                    // Per-frame NSLog calls are synchronous IPC and were
-                    // costing ~150 calls/s at 30 fps. Sample once every 10
-                    // seconds instead.
-                    self.logger.info("Sink received frame #\(sequenceNumber)")
-                    if sequenceNumber > 0 {
-                        SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
-                            message: "Sink consumed frame #\(sequenceNumber)")
-                    }
+                // Sample the cadence to the shared log ~every 10s at 30fps.
+                if sequenceNumber > 0 && sequenceNumber % 300 == 0 {
+                    SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
+                        message: "Sink consumed frame #\(sequenceNumber)")
                 }
-
-                if let consumeCallback = self.consumeSampleBuffer {
-                    consumeCallback(sampleBuffer)
-                }
-
-                // Keep draining without growing the stack. Even when
-                // hasMoreSampleBuffers is true, we hop through the consumer
-                // queue rather than synchronously recursing inside CMIO's
-                // own callback frame (which previously risked stack growth
-                // proportional to the queue depth).
-                self.scheduleConsumeNextBuffer(after: hasMoreSampleBuffers ? 0 : 0.033)
-            } else {
-                // Queue empty — poll at ~30 fps.
-                self.scheduleConsumeNextBuffer(after: 0.033)
+                // Forward to the source stream via the device source's bridge
+                // closure (set in startSinkStreaming). Forwarding is unconditional;
+                // a source send with no consumer attached is harmless.
+                self.consumeSampleBuffer?(sampleBuffer)
+                // Success → re-arm immediately; self-pacing to delivery rate.
+                self.rearmConsume(cushionMs: 0)
+                return
             }
+
+            if let error = error {
+                // Transient (queue momentarily empty, client busy). DO NOT tear
+                // down — the reference never gives up here. Just re-arm after a
+                // small cushion so a burst of errors can't hot-spin the queue.
+                // The loop ends only when stopStream() flips the subscribing flag.
+                SharedExtensionLog.shared.write(level: .info, category: "Ext.SinkStream",
+                    message: "consumeSampleBuffer transient (re-arming): \(error.localizedDescription)")
+                self.rearmConsume(cushionMs: 20)
+                return
+            }
+
+            // No buffer, no error → queue empty. Re-arm with a small cushion.
+            self.rearmConsume(cushionMs: 5)
         }
     }
 }
@@ -463,21 +367,6 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
             throw NSError(domain: "GigEVirtualCamera", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid device source"])
         }
         
-        // Write debug marker to UserDefaults
-        if let groupDefaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera") {
-            groupDefaults.set("Source stream started at \(Date())", forKey: "Debug_SourceStreamStarted")
-            
-            // IMPORTANT: Notify app that a new client has connected
-            // This will trigger the app to restart camera streaming if needed
-            var streamState = groupDefaults.dictionary(forKey: "StreamState") ?? [:]
-            streamState["newClientConnected"] = true
-            streamState["clientConnectedTime"] = Date().timeIntervalSince1970
-            groupDefaults.set(streamState, forKey: "StreamState")
-            groupDefaults.synchronize()
-            
-            NSLog("🎬🎬🎬 Notified app about new client connection")
-        }
-        
         NSLog("🎬🎬🎬 SOURCE STREAM STARTING - Sink active: \(deviceSource.isSinking)")
         NSLog("🎬🎬🎬 Current streamingCounter BEFORE increment: \(deviceSource.streamingCounter)")
         logger.info("🟢 Starting source stream")
@@ -563,6 +452,11 @@ class SourceStreamSource: NSObject, CMIOExtensionStreamSource {
 
         let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 
+        // Single-producer invariant: while real frames flow, the idle watchdog
+        // stays silent (it self-suppresses on fresh lastRealFrameUptimeNs), so
+        // this clamp is a safety net over an already-monotonic timeline rather
+        // than an arbiter between racing producers. Browsers freeze on a
+        // non-monotonic hostTime, so the clamp stays as belt-and-suspenders.
         os_unfair_lock_lock(&sendLock)
         // Clamp to strictly-increasing. Bump by 1 ns rather than dropping;
         // ns-level jitter is imperceptible to video and a dropped frame is
@@ -736,12 +630,8 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
 
     // Stream state. CMIO can invoke startStream/stopStream on any thread, and
     // the source-stream and sink-stream lifecycles can interleave (consumer
-    // connects while app is in the middle of attaching its sink, etc.). The
-    // "first-client" and "last-client" branches below relied on bare reads of
-    // these counters, which produced stale-state windows where the extension
-    // either over-signaled the app (multiple signalNeedFrames calls per
-    // consumer) or under-signaled (consumer fully attached without the app
-    // ever being woken). All mutations and decisions happen under stateLock.
+    // connects while app is in the middle of attaching its sink, etc.). All
+    // mutations and decisions happen under stateLock.
     private var _streamingCounter = 0
     private var _isSinking = false
     private var stateLock = os_unfair_lock()
@@ -766,9 +656,6 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
         return _streamingCounter
     }
 
-    // App coordination
-    private let streamStateCoordinator = StreamStateCoordinator()
-    
     init(localizedName: String) {
         super.init()
         
@@ -870,32 +757,15 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
     
     // Called by source stream when client starts watching
     func startStreaming() {
-        // Decide whether we are the first client and whether the sink is
-        // already serving frames — atomically, so a concurrent consumer
-        // attach/detach can't make us double-signal or skip signaling.
         os_unfair_lock_lock(&stateLock)
         _streamingCounter += 1
         let counter = _streamingCounter
         let sinking = _isSinking
-        let shouldSignalNeedFrames = (counter == 1) && !sinking
         os_unfair_lock_unlock(&stateLock)
 
         logger.info("🎬 Source stream started. Client count: \(counter), sink: \(sinking)")
         SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
             message: "🎬 Source stream started (clients: \(counter), sink active: \(sinking))")
-
-        // Notify outside the lock — signalNeedFrames touches UserDefaults
-        // and shouldn't hold the lock across an IPC-style write.
-        if shouldSignalNeedFrames {
-            logger.info("📢 Signaling app to start sending frames")
-            SharedExtensionLog.shared.write(level: .notice, category: "Ext.Device",
-                message: "📢 Signaling app to start sending frames (newClientConnected=true)")
-            streamStateCoordinator.signalNeedFrames()
-        } else if counter == 1 && sinking {
-            logger.info("✅ Sink already active - frames should be flowing")
-            SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
-                message: "✅ Sink already active - frames should be flowing")
-        }
     }
 
     // Called by source stream when client stops watching
@@ -905,18 +775,11 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
             _streamingCounter -= 1
         }
         let counter = _streamingCounter
-        let shouldSignalStopped = (counter == 0)
         os_unfair_lock_unlock(&stateLock)
 
         logger.info("Source stream stopped. Client count: \(counter)")
         SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
             message: "Source stream stopped (clients remaining: \(counter))")
-
-        if shouldSignalStopped {
-            SharedExtensionLog.shared.write(level: .info, category: "Ext.Device",
-                message: "Signaling app: streamActive=false (last client gone)")
-            streamStateCoordinator.signalStreamStopped()
-        }
     }
 
     // Called by sink stream when app starts sending

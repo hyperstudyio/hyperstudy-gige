@@ -13,65 +13,6 @@ import os.log
 import os.lock
 import FramePipelineKit
 
-// MARK: - Stream State Monitor
-
-class StreamStateMonitor {
-    private let logger = Logger(subsystem: "com.lukechang.GigEVirtualCamera", category: "StreamStateMonitor")
-    private let appGroupID = "group.S368GH6KF7.com.lukechang.GigEVirtualCamera"
-    private var observer: NSObjectProtocol?
-    private var timer: Timer?
-
-    // Last value reported to the callback. `nil` means we haven't observed
-    // a value yet, so the next read should always fire (covers startup).
-    // Without this gate the 0.25s poll and the `UserDefaults.didChangeNotification`
-    // observer combined to re-fire the callback ~7-8×/s even when the
-    // extension's `streamActive` flag hadn't changed.
-    private var lastIsActive: Bool?
-
-    private var groupDefaults: UserDefaults? {
-        UserDefaults(suiteName: appGroupID)
-    }
-
-    func startMonitoring(onStreamStateChange: @escaping (Bool) -> Void) {
-        // Monitor UserDefaults changes
-        observer = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification,
-            object: groupDefaults,
-            queue: .main
-        ) { [weak self] _ in
-            self?.checkStreamState(onStreamStateChange: onStreamStateChange)
-        }
-
-        // Also poll periodically as backup
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            self?.checkStreamState(onStreamStateChange: onStreamStateChange)
-        }
-
-        // Check initial state
-        checkStreamState(onStreamStateChange: onStreamStateChange)
-    }
-
-    func stopMonitoring() {
-        if let observer = observer {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        timer?.invalidate()
-        timer = nil
-        lastIsActive = nil
-    }
-
-    private func checkStreamState(onStreamStateChange: @escaping (Bool) -> Void) {
-        guard let state = groupDefaults?.dictionary(forKey: "StreamState"),
-              let isActive = state["streamActive"] as? Bool else {
-            return
-        }
-
-        guard isActive != lastIsActive else { return }
-        lastIsActive = isActive
-        onStreamStateChange(isActive)
-    }
-}
-
 // MARK: - CMIO Sink Connector
 
 class CMIOSinkConnector {
@@ -133,31 +74,12 @@ class CMIOSinkConnector {
 
     private var livenessLock = os_unfair_lock()
 
-    /// Thread-safe accessor for the watchdog. Returns 0 if no frame has ever
-    /// been sent through this connector.
-    var lastSuccessfulSendUptimeNs: UInt64 {
-        os_unfair_lock_lock(&livenessLock)
-        defer { os_unfair_lock_unlock(&livenessLock) }
-        return _lastSuccessfulSendUptimeNs
-    }
-
     /// Total number of times the PTS monotonicity guard had to nudge a
     /// timestamp forward. Should stay at 0 in healthy operation.
     var nonMonotonicNudges: UInt64 {
         os_unfair_lock_lock(&livenessLock)
         defer { os_unfair_lock_unlock(&livenessLock) }
         return _nonMonotonicNudges
-    }
-
-    /// Successful enqueues since the current sink session started. The stall
-    /// watchdog only flags a stall once this exceeds a threshold roughly an
-    /// order of magnitude larger than the sink queue's capacity, so initial
-    /// queue-fill (with no consumer attached) doesn't get reported as a
-    /// stall — it's just an idle state, no consumer is reading the camera.
-    var sessionSendCount: UInt64 {
-        os_unfair_lock_lock(&livenessLock)
-        defer { os_unfair_lock_unlock(&livenessLock) }
-        return _sessionSendCount
     }
 
     /// Average measured fps over the current sink session, or `nil` if no
@@ -179,9 +101,6 @@ class CMIOSinkConnector {
         return Double(_sessionSendCount - 1) / elapsedSec
     }
 
-    // Stream state monitoring
-    private let streamStateMonitor = StreamStateMonitor()
-
     // Property listener for automatic sink detection
     private var propertyListener: CMIOPropertyListener?
 
@@ -194,6 +113,14 @@ class CMIOSinkConnector {
     private var connectionRetryCount = 0
     private let maxRetryAttempts = 3
     private let retryDelay: TimeInterval = 2.0
+
+    // Drives initial connection: polls discovery every second until the sink
+    // is connected, then stops. This is connection-establishment correctness,
+    // NOT a recovery watchdog — once connected it never polls again. Replaces
+    // the previous one-shot-at-launch + property-listener-only path that sat
+    // silent forever if it missed the initial CMIO change event.
+    private var connectPollTimer: Timer?
+    private var connectPollAttempts = 0
     
     init() {
         logger.info("CMIOSinkConnector initialized - starting property listener setup")
@@ -212,8 +139,8 @@ class CMIOSinkConnector {
     deinit {
         connectionRetryTimer?.invalidate()
         connectionRetryTimer = nil
+        connectPollTimer?.invalidate()
         propertyListener?.stopListening()
-        streamStateMonitor.stopMonitoring()
     }
     
     // MARK: - Property Listener Setup
@@ -277,40 +204,48 @@ class CMIOSinkConnector {
     
     // MARK: - Public Interface
 
+    @discardableResult
     func connect() -> Bool {
-        logger.info("Connect called - waiting for sink stream discovery via property listener...")
+        if isConnected { return true }
+        if propertyListener == nil { setupPropertyListener() }
 
-        if propertyListener == nil {
-            setupPropertyListener()
+        // If we already have discovered IDs, connect now.
+        if let streamID = sinkStreamID, let deviceID = deviceID,
+           connectToSinkStream(streamID: streamID, deviceID: deviceID) {
+            return true
         }
 
-        // If we already have a discovered sink stream, connect to it
-        if let streamID = sinkStreamID, let deviceID = deviceID {
-            return connectToSinkStream(streamID: streamID, deviceID: deviceID)
-        }
-
-        // We don't have IDs yet. The property listener has been registered,
-        // but it only fires on CMIO change notifications — if the sink stream
-        // is already registered with the OS and unchanged since we missed the
-        // initial event, the listener will sit silent forever. Re-run manual
-        // discovery so a stall-recovery / user-initiated retry isn't a no-op.
-        logger.info("No cached sink IDs; running manual CMIO discovery as fallback")
+        // Otherwise actively discover+connect, and keep polling until we do.
         tryManualDiscovery()
+        if isConnected { return true }
+        startConnectPolling()
         return false
     }
 
-    /// Public-facing forced rediscovery. Used by the stall watchdog and the
-    /// "Retry CMIO Sink" button. Bypasses any cached state — it asks CMIO for
-    /// the current device list and tries to attach if our sink stream is
-    /// present. Without this, the listener-only path was a dead end: after
-    /// `handleDisconnection` cleared the IDs, nothing re-fetched them and the
-    /// app waited forever for a property-changed callback that never came.
-    func forceRediscovery() {
-        logger.info("Forced rediscovery requested")
-        if propertyListener == nil {
-            setupPropertyListener()
+    private func startConnectPolling() {
+        guard connectPollTimer == nil else { return }
+        connectPollAttempts = 0
+        connectPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.isConnected { self.stopConnectPolling(); return }
+            self.connectPollAttempts += 1
+            // After 10 quick attempts, the device almost certainly isn't there
+            // (extension not installed/approved). Keep trying, but slower, and
+            // surface a clear, actionable log line — not a silent dead end.
+            if self.connectPollAttempts == 10 {
+                self.logger.error("Virtual camera device not found after 10s — is the extension installed and approved in System Settings?")
+            }
+            if self.connectPollAttempts > 10 && self.connectPollAttempts % 5 != 0 {
+                return  // throttle to once every 5s past the first 10 attempts
+            }
+            self.tryManualDiscovery()
+            if self.isConnected { self.stopConnectPolling() }
         }
-        tryManualDiscovery()
+    }
+
+    private func stopConnectPolling() {
+        connectPollTimer?.invalidate()
+        connectPollTimer = nil
     }
 
     func disconnect() {
@@ -358,15 +293,13 @@ class CMIOSinkConnector {
         os_unfair_lock_unlock(&livenessLock)
 
         isConnected = true
+        stopConnectPolling()
         connectionRetryCount = 0  // Reset retry count on success
         logger.info("✅ Successfully connected to virtual camera sink stream via property listener!")
         
         // Notify callbacks
         onConnectionStateChanged?(true)
-        
-        // Start monitoring stream state
-        startStreamStateMonitoring()
-        
+
         return true
     }
     
@@ -411,10 +344,7 @@ class CMIOSinkConnector {
         self.sinkStreamID = nil
         self.deviceID = nil
         self.isConnected = false
-        
-        // Stop monitoring
-        streamStateMonitor.stopMonitoring()
-        
+
         // Notify callbacks
         onConnectionStateChanged?(false)
         onSinkStreamAvailable?(false)
@@ -727,21 +657,6 @@ class CMIOSinkConnector {
                 }
                 
                 break
-            }
-        }
-    }
-    
-    // MARK: - Stream State Monitoring
-    
-    private func startStreamStateMonitoring() {
-        streamStateMonitor.startMonitoring { [weak self] isActive in
-            if isActive {
-                self?.logger.info("Extension signaled it needs frames")
-                // Notify CameraManager to handle the stream state change
-                NotificationCenter.default.post(name: NSNotification.Name("StreamStateChanged"), object: nil)
-            } else {
-                self?.logger.info("Extension signaled to stop frames")
-                NotificationCenter.default.post(name: NSNotification.Name("StreamStateChanged"), object: nil)
             }
         }
     }

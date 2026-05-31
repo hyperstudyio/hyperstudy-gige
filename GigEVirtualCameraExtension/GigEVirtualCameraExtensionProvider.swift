@@ -697,14 +697,20 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
         let deviceID = UUID(uuidString: "4B59CDEF-BEA6-52E8-06E7-AD1B8E6B29C4")!
         self.device = CMIOExtensionDevice(localizedName: localizedName, deviceID: deviceID, legacyDeviceID: nil, source: self)
         
-        // Get format from shared UserDefaults
-        let groupDefaults = UserDefaults(suiteName: "group.S368GH6KF7.com.lukechang.GigEVirtualCamera")
-        let width = Int32(groupDefaults?.integer(forKey: "SelectedFormatWidth") ?? 1920)
-        let height = Int32(groupDefaults?.integer(forKey: "SelectedFormatHeight") ?? 1080)
-        let fps = groupDefaults?.integer(forKey: "SelectedFormatFPS") ?? 30
-        
-        logger.info("Creating streams with format: \(width)×\(height) @ \(fps)fps")
-        
+        // The advertised format MUST match the bytes the app actually delivers,
+        // or the consumer negotiates one format and receives another and freezes
+        // after the first frames. The app's PixelBufferConverter.convertToHD
+        // scales EVERY frame to a fixed 1280×720 (its default target), so the
+        // virtual camera advertises exactly that. These dimensions MUST stay in
+        // sync with convertToHD's targetWidth/targetHeight. (We intentionally do
+        // NOT read the resolution from UserDefaults: the format-selection UI does
+        // not change convertToHD's output, so reading it only reintroduces the
+        // 1080p-advertised / 720p-delivered mismatch.)
+        let width: Int32 = 1280
+        let height: Int32 = 720
+
+        logger.info("Creating streams with format: \(width)×\(height) (variable frame rate)")
+
         // Create video format for both streams
         // Use 420v format which is standard for video
         let formatDict: [String: Any] = [
@@ -713,7 +719,7 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
             kCVPixelBufferHeightKey as String: Int(height),
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ]
-        
+
         var videoDescription: CMFormatDescription?
         CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
@@ -723,16 +729,24 @@ class GigEVirtualCameraExtensionDeviceSource: NSObject, CMIOExtensionDeviceSourc
             extensions: formatDict as CFDictionary,
             formatDescriptionOut: &videoDescription
         )
-        
+
         guard let videoDesc = videoDescription else {
             logger.error("Failed to create video format description")
             return
         }
-        
+
+        // Variable frame rate. The MRC delivers a variable real-world rate
+        // (observed 16–51 fps), so advertise a RANGE, not a fixed cadence.
+        // A fixed min==max==1/30 promised a rigid 30 fps the camera never
+        // honors, contradicting the per-frame timestamps and freezing strict
+        // consumers (WebRTC/HyperStudy). min = fastest allowed (1/60), max =
+        // slowest allowed (1/2). Actual per-frame timing is carried by each
+        // buffer's presentation timestamp — NOT by this range — so the
+        // capture-time timeline HyperStudy relies on for sync is preserved.
         let videoStreamFormat = CMIOExtensionStreamFormat(
             formatDescription: videoDesc,
-            maxFrameDuration: CMTime(value: 1, timescale: CMTimeScale(fps)),
-            minFrameDuration: CMTime(value: 1, timescale: CMTimeScale(fps)),
+            maxFrameDuration: CMTime(value: 1, timescale: 2),
+            minFrameDuration: CMTime(value: 1, timescale: 60),
             validFrameDurations: nil
         )
         

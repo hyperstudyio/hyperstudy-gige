@@ -287,8 +287,22 @@ class CameraManager: NSObject, ObservableObject {
         // explosion seen in diagnostics (8 → 17 fanout over a single session).
     }
     
+    /// Guards against overlapping connect sequences. A GigE camera allows only
+    /// ONE control client, so two concurrent arv_camera_new() calls collide and
+    /// can strand a control-channel handle (the "must quit the app to reconnect"
+    /// leak, confirmed by relaunch fixing it). Only one connect runs at a time;
+    /// duplicate requests are ignored until it resolves. Cleared on every
+    /// terminal path (success, retry-success, final failure, camera-not-found).
+    private var isConnecting = false
+
     private func connectToCamera(withId cameraId: String) {
         let gigEManager = GigECameraManager.shared
+
+        guard !isConnecting else {
+            logger.warning("Connect already in progress — ignoring duplicate request for \(cameraId)")
+            return
+        }
+        isConnecting = true
 
         logger.info("Attempting to connect to camera: \(cameraId)")
         connectionState = "Connecting"
@@ -323,6 +337,7 @@ class CameraManager: NSObject, ObservableObject {
             logger.error("Camera not found in available cameras list")
             connectionState = "Failed"
             cameraModel = "Camera not found"
+            isConnecting = false
         }
     }
     
@@ -336,7 +351,8 @@ class CameraManager: NSObject, ObservableObject {
                 self?.connectionState = "Connected"
                 self?.cameraModel = camera.modelName
                 self?.isConnected = true
-                
+                self?.isConnecting = false
+
                 // Load camera settings
                 self?.loadCameraSettings()
                 
@@ -379,7 +395,8 @@ class CameraManager: NSObject, ObservableObject {
                             self?.connectionState = "Connected"
                             self?.cameraModel = camera.modelName
                             self?.isConnected = true
-                            
+                            self?.isConnecting = false
+
                             // Load camera settings
                             self?.loadCameraSettings()
                             
@@ -409,6 +426,7 @@ class CameraManager: NSObject, ObservableObject {
                             self?.connectionState = "Failed"
                             self?.cameraModel = "Connection failed"
                             self?.isConnected = false
+                            self?.isConnecting = false
                             
                             // Don't reset selection - let user retry manually
                             // self?.selectedCameraId = nil

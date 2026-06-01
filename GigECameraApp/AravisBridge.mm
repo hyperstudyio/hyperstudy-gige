@@ -312,12 +312,24 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
     });
     
     @synchronized(self) {
+        // Release the STREAM before the CAMERA, synchronously, here. stopStreaming
+        // releases the stream on a deferred main-queue block that can run AFTER
+        // this disconnect unrefs the camera (or not before a fast reconnect),
+        // leaving the ArvStream holding the GigE device/control channel open
+        // until the process exits — the "must quit the app to reconnect" leak.
+        // NULL-guarded so the deferred block in stopStreaming becomes a no-op
+        // (no double-free); that block is also @synchronized on self.
+        if (_stream) {
+            NSLog(@"AravisBridge: Releasing stream (disconnect)...");
+            g_object_unref(_stream);
+            _stream = NULL;
+        }
         if (_camera) {
             NSLog(@"AravisBridge: Releasing camera...");
             g_object_unref(_camera);
             _camera = NULL;
         }
-        
+
         _currentCamera = nil;
         [self setState:AravisCameraStateDisconnected];
     }
@@ -439,18 +451,21 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
         arv_camera_stop_acquisition(_camera, NULL);
     }
     
-    // Wait a bit for frame processing to finish
+    // Wait for frame processing to finish, then free the stream. Guard the
+    // stream release under @synchronized + NULL-check so it can't race or
+    // double-free with disconnect's synchronous release of the same stream.
     dispatch_async(_frameQueue, ^{
-        // This ensures processFrames has exited before we free the stream
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (self->_stream) {
-                NSLog(@"AravisBridge: Releasing stream...");
-                g_object_unref(self->_stream);
-                self->_stream = NULL;
-            }
-            
-            if (self->_state == AravisCameraStateStreaming) {
-                [self setState:AravisCameraStateConnected];
+            @synchronized(self) {
+                if (self->_stream) {
+                    NSLog(@"AravisBridge: Releasing stream...");
+                    g_object_unref(self->_stream);
+                    self->_stream = NULL;
+                }
+
+                if (self->_state == AravisCameraStateStreaming) {
+                    [self setState:AravisCameraStateConnected];
+                }
             }
         });
     });

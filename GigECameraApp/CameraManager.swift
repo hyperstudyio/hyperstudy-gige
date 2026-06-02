@@ -103,15 +103,6 @@ class CameraManager: NSObject, ObservableObject {
     @Published var isShowingPreview = false
     @Published var isFrameSenderConnected = false  // Will be set true when sink connects
 
-    /// Inert UI property. Reliability now comes from pipeline correctness
-    /// rather than a supervising watchdog, so nothing flips this true; it stays
-    /// `false`. Kept only because `ContentView` binds to it.
-    @Published var streamStalled = false
-
-    /// Inert UI property. Always `0` now that the stall watchdog is gone. Kept
-    /// only because `ContentView` binds to it.
-    @Published var streamStallDurationSec: Double = 0
-
     /// Cumulative count of times the PTS monotonicity guard had to nudge a
     /// timestamp forward. Should stay at 0 in healthy operation.
     @Published var ptsNudgeCount: UInt64 = 0
@@ -604,11 +595,6 @@ class CameraManager: NSObject, ObservableObject {
     
     
     // MARK: - Public Methods for Frame Sender
-    func retryFrameSenderConnection() {
-        logger.info("Retrying CMIO sink connection...")
-        reconnectSink()
-    }
-    
     func testSinkStreamConnection() {  // Keep method name for compatibility
         logger.info("Testing CMIO sink stream connection...")
         
@@ -683,19 +669,6 @@ class CameraManager: NSObject, ObservableObject {
         // The actual cleanup is handled by the CameraPreviewSection's onDisappear
     }
     
-    /// The single deterministic sink reconnect path. Used for in-app lifecycle
-    /// events (camera switch, stop/start). No watchdog calls this — it is invoked
-    /// only from explicit user/lifecycle actions. Order matters: stop capture,
-    /// release the sink, then reconnect.
-    func reconnectSink() {
-        logger.info("Reconnecting sink (deterministic path)")
-        if GigECameraManager.shared.isStreaming {
-            GigECameraManager.shared.stopStreaming()
-        }
-        sinkConnector.disconnect()
-        _ = sinkConnector.connect()  // connect() polls until the device is reachable
-    }
-
     // MARK: - Frame Handler Setup
     private func setupFrameHandler() {
         // Stream consumer: runs on GigECameraManager.streamQueue (background).
@@ -1055,8 +1028,6 @@ final class DiagnosticsLog: ObservableObject {
         let isCameraConnected: Bool
         let isStreaming: Bool
         let sinkConnected: Bool
-        let streamStalled: Bool
-        let streamStallDurationSec: Double
         let ptsNudgeCount: UInt64
         let currentFormat: String
         let frameRate: Double
@@ -1304,8 +1275,6 @@ final class DiagnosticsLog: ObservableObject {
             isCameraConnected: cameraManager.isConnected,
             isStreaming: GigECameraManager.shared.isStreaming,
             sinkConnected: cameraManager.isFrameSenderConnected,
-            streamStalled: cameraManager.streamStalled,
-            streamStallDurationSec: cameraManager.streamStallDurationSec,
             ptsNudgeCount: cameraManager.ptsNudgeCount,
             currentFormat: liveFormat,
             frameRate: cameraManager.frameRate,
@@ -1331,8 +1300,6 @@ final class DiagnosticsLog: ObservableObject {
         out += "  Camera connected:    \(snapshot.isCameraConnected)\n"
         out += "  Camera streaming:    \(snapshot.isStreaming)\n"
         out += "  Sink connected:      \(snapshot.sinkConnected)\n"
-        out += "  Stream stalled:      \(snapshot.streamStalled)\n"
-        out += "  Stall duration (s):  \(String(format: "%.2f", snapshot.streamStallDurationSec))\n"
         out += "  PTS nudges (cum.):   \(snapshot.ptsNudgeCount)\n"
         out += "  Current format:      \(snapshot.currentFormat)\n"
         out += "  Frame rate (fps):    \(String(format: "%.2f", snapshot.frameRate))\n"

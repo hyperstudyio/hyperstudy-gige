@@ -8,10 +8,28 @@
 #import "AravisBridge.h"
 #import <dispatch/dispatch.h>
 #import <IOSurface/IOSurface.h>
+#import <os/log.h>
 #import "GigEVirtualCamera-Swift.h"
 
 extern "C" {
 #include <arv.h>
+}
+
+// Structured logger for the GigE stream. AravisBridge historically logged via
+// NSLog, which carries no subsystem and is therefore invisible to the in-app
+// Diagnostics drawer / JSON export (that query filters OSLogStore by
+// subsystem == "com.lukechang.GigEVirtualCamera"). Routing the frame-loop
+// signals through os_log on the app's subsystem makes them show up in the
+// exported diagnostics, so a GVSP stream wedge is observable post-hoc rather
+// than only in a live `log stream` session. Category "AravisStream" so it can
+// be filtered apart from the Swift components.
+static os_log_t AravisStreamLog(void) {
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        log = os_log_create("com.lukechang.GigEVirtualCamera", "AravisStream");
+    });
+    return log;
 }
 
 @implementation AravisCamera {
@@ -512,9 +530,29 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
                 // info level; duplicating it here just floods the unified
                 // log and makes the Diagnostics drawer noisy. Errors and
                 // state transitions below still log normally.
+                //
+                // Low-rate stream-stats heartbeat (~every 2.5s at 59 fps) so
+                // the diagnostics export shows the GVSP packet-loss trend
+                // (missing / resent climbing) BEFORE a wedge, and the exact
+                // frame count at which `n-completed-buffers` stops advancing.
+                if (frameCount % 150 == 0 && ARV_IS_GV_STREAM(_stream)) {
+                    guint64 completed = 0, failures = 0, underruns = 0, resent = 0, missing = 0;
+                    g_object_get(_stream,
+                                 "n-completed-buffers", &completed,
+                                 "n-failures", &failures,
+                                 "n-underruns", &underruns,
+                                 "n-resent-packets", &resent,
+                                 "n-missing-packets", &missing,
+                                 NULL);
+                    os_log_info(AravisStreamLog(),
+                                "Stream healthy — frames=%d completed=%llu failures=%llu underruns=%llu resent=%llu missing=%llu",
+                                frameCount, completed, failures, underruns, resent, missing);
+                }
                 [self processBuffer:buffer];
             } else {
                 NSLog(@"AravisBridge: Buffer status error: %d", status);
+                os_log_error(AravisStreamLog(),
+                             "Buffer status error: %d (frames so far=%d)", status, frameCount);
                 // Log more details about the error
                 switch (status) {
                     case ARV_BUFFER_STATUS_UNKNOWN:
@@ -569,8 +607,19 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
                 
                 NSLog(@"AravisBridge: Stream stats - completed: %llu, failures: %llu, underruns: %llu, resent: %llu, missing: %llu",
                       n_completed_buffers, n_failures, n_underruns, n_resent_packets, n_missing_packets);
+
+                // The decisive freeze signal. During a stall this fires ~once
+                // per second (the loop is parked on the 1s pop timeout). If
+                // `completed` is flat while `missing`/`resent` climb, the GVSP
+                // stream wedged on packet loss; if all counters are flat, the
+                // camera stopped sending entirely (link/socket orphaned). Logged
+                // at error level so it surfaces in the diagnostics export.
+                os_log_error(AravisStreamLog(),
+                             "Frame timeout #%d — completed=%llu failures=%llu underruns=%llu resent=%llu missing=%llu",
+                             timeoutCount, n_completed_buffers, n_failures, n_underruns,
+                             n_resent_packets, n_missing_packets);
             }
-            
+
             // Only check connection after first timeout
             if (timeoutCount == 1) {
                 NSLog(@"AravisBridge: Checking camera state after first timeout");
@@ -582,8 +631,14 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
             }
         }
     }
-    
+
     NSLog(@"AravisBridge: processFrames ended - received %d frames, %d timeouts", frameCount, timeoutCount);
+    // Surface loop exit in the diagnostics export so we can tell a clean stop
+    // (shouldStopStreaming=YES from user disconnect) apart from the loop never
+    // exiting at all (the freeze: stuck spinning on pop timeouts forever).
+    os_log_error(AravisStreamLog(),
+                 "processFrames ENDED — frames=%d timeouts=%d state=%d shouldStop=%d streamNull=%d",
+                 frameCount, timeoutCount, (int)_state, (int)self.shouldStopStreaming, (int)(_stream == NULL));
 }
 
 - (void)processBuffer:(ArvBuffer *)buffer {

@@ -113,13 +113,6 @@ struct ContentView: View {
                 .environmentObject(cameraManager)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            if cameraManager.streamStalled {
-                StreamStalledBanner(
-                    durationSec: cameraManager.streamStallDurationSec,
-                    onRecover: { cameraManager.retryFrameSenderConnection() }
-                )
-            }
-
             liveStatusFooter
         }
         .padding(DesignSystem.Spacing.medium)
@@ -590,57 +583,6 @@ struct StatusRow: View {
 }
 
 // MARK: - Stream Stalled Banner
-
-/// Surfaces the stream-stall watchdog state. The user MUST see this if frames
-/// have stopped flowing -- silent failure during an fMRI scan invalidates data.
-struct StreamStalledBanner: View {
-    let durationSec: Double
-    let onRecover: () -> Void
-
-    private var durationText: String {
-        String(format: "%.1f", durationSec)
-    }
-
-    var body: some View {
-        HStack(spacing: DesignSystem.Spacing.small) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 18, weight: .bold))
-                .foregroundColor(DesignSystem.Colors.textOnAccent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Stream stalled — frames not flowing")
-                    .font(DesignSystem.Typography.callout)
-                    .fontWeight(.semibold)
-                    .foregroundColor(DesignSystem.Colors.textOnAccent)
-                Text("No frame has been delivered in \(durationText)s. Recording may be losing data.")
-                    .font(DesignSystem.Typography.caption)
-                    .foregroundColor(DesignSystem.Colors.textOnAccent.opacity(0.9))
-            }
-            Spacer()
-            // Bold filled button so the recovery action reads as the primary
-            // CTA even on a saturated red banner -- the previous "white pill
-            // with red text" was visually muted on a red surface.
-            Button(action: onRecover) {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.clockwise")
-                    Text("Reconnect")
-                        .fontWeight(.semibold)
-                }
-                .font(DesignSystem.Typography.caption)
-                .foregroundColor(DesignSystem.Colors.statusError)
-                .padding(.horizontal, DesignSystem.Spacing.small)
-                .padding(.vertical, 5)
-                .background(DesignSystem.Colors.textOnAccent)
-                .cornerRadius(DesignSystem.CornerRadius.small)
-                .shadow(color: .black.opacity(0.2), radius: 1, y: 1)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(DesignSystem.Spacing.medium)
-        .background(DesignSystem.Colors.statusError)
-        .cornerRadius(DesignSystem.CornerRadius.medium)
-    }
-}
-
 
 // MARK: - Visual Effect Background
 

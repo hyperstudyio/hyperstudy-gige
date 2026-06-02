@@ -49,17 +49,21 @@ class NetworkInterfaceMonitor: NSObject {
         let currentInterfaces = Set(path.availableInterfaces.map { $0.name })
         
         if currentInterfaces != lastKnownInterfaces {
-            logger.info("Network interfaces changed: \(currentInterfaces)")
-            
+            // Interface names logged .public so the diagnostics export shows
+            // WHICH interfaces churned — distinguishes the camera's own en
+            // interface flapping (the suspected stream-killer) from unrelated
+            // noise like awdl0 / Wi-Fi scans that we should ignore.
+            logger.info("Network interfaces changed: \(currentInterfaces.sorted().joined(separator: ", "), privacy: .public)")
+
             // Check if this looks like a GigE camera interface change
             let addedInterfaces = currentInterfaces.subtracting(lastKnownInterfaces)
             let removedInterfaces = lastKnownInterfaces.subtracting(currentInterfaces)
-            
+
             if !addedInterfaces.isEmpty {
-                logger.info("New interfaces: \(addedInterfaces)")
+                logger.info("New interfaces: \(addedInterfaces.sorted().joined(separator: ", "), privacy: .public)")
             }
             if !removedInterfaces.isEmpty {
-                logger.info("Removed interfaces: \(removedInterfaces)")
+                logger.info("Removed interfaces: \(removedInterfaces.sorted().joined(separator: ", "), privacy: .public)")
             }
             
             lastKnownInterfaces = currentInterfaces
@@ -114,7 +118,11 @@ class NetworkInterfaceMonitor: NSObject {
         }
         
         if !relevantChanges.isEmpty {
-            logger.info("Network configuration changed: \(relevantChanges)")
+            // .public so the export reveals the exact changed keys (e.g.
+            // State:/Network/Interface/en5/Link vs .../awdl0/IPv4) instead of
+            // the redacted "<private>" — that one string tells us whether the
+            // camera's interface is the one transitioning.
+            logger.info("Network configuration changed: \(relevantChanges.joined(separator: ", "), privacy: .public)")
             
             // Debounce multiple rapid changes
             NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(triggerDiscovery), object: nil)

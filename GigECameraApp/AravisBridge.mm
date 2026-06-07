@@ -32,6 +32,22 @@ static os_log_t AravisStreamLog(void) {
     return log;
 }
 
+// GVSP receive-thread priority hook. Aravis invokes this on its own stream
+// receive thread; on INIT we elevate that thread so the app's per-frame work
+// (debayer → BGRA→YUV → CMIO enqueue → preview) cannot starve packet draining.
+// A starved receive thread lets the kernel UDP socket buffer overflow and drops
+// GVSP packets — the measured root cause of the stream freeze. Try realtime
+// scheduling first; fall back to an elevated nice level if RT isn't permitted
+// (e.g. without the entitlement). See docs/CAMERA_MR_CAM_HR_REFERENCE.md.
+static void AravisStreamThreadInit(void *user_data, ArvStreamCallbackType type, ArvBuffer *buffer) {
+    (void)user_data; (void)buffer;
+    if (type == ARV_STREAM_CALLBACK_TYPE_INIT) {
+        if (!arv_make_thread_realtime(20)) {
+            arv_make_thread_high_priority(-10);
+        }
+    }
+}
+
 @implementation AravisCamera {
     NSString *_name;
     NSString *_modelName;
@@ -294,7 +310,7 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
                 NSLog(@"AravisBridge: Set packet size to 1400");
             }
         } else {
-            NSLog(@"AravisBridge: Set packet size to 8228 (jumbo frames)");
+            NSLog(@"AravisBridge: Set packet size to 1500");
         }
         
         // Set packet delay to prevent overwhelming the network
@@ -367,9 +383,11 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
     
     GError *error = NULL;
     
-    // Create stream
+    // Create stream with a thread-init callback so the GVSP receive thread runs
+    // at elevated priority (see AravisStreamThreadInit) — keeps packet draining
+    // ahead of the app's per-frame processing load.
     NSLog(@"AravisBridge: Creating stream...");
-    _stream = arv_camera_create_stream(_camera, NULL, NULL, &error);
+    _stream = arv_camera_create_stream(_camera, AravisStreamThreadInit, NULL, &error);
     if (!_stream) {
         [self handleError:error message:@"Failed to create stream"];
         if (error) g_error_free(error);
@@ -417,13 +435,28 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
         
         // Set frame retention time (in microseconds)
         g_object_set(_stream, "frame-retention", 200000, NULL);  // 200ms
-        
-        NSLog(@"AravisBridge: GigE stream configured with packet resend enabled");
+
+        // Size the GVSP receive socket buffer well above a single frame.
+        // macOS defaults net.inet.udp.recvspace to ~768 KB — smaller than ONE
+        // 921,600-byte frame — so any receive-thread delay overflows it and
+        // drops packets, the measured cause of the stream freeze. Use a large
+        // FIXED buffer; the kernel caps it at kern.ipc.maxsockbuf (8 MB on the
+        // target host ≈ ~9 frames of headroom). In a live 90 s test this took
+        // packet loss from 575 to 0. See docs/CAMERA_MR_CAM_HR_REFERENCE.md.
+        g_object_set(_stream,
+                     "socket-buffer", ARV_GV_STREAM_SOCKET_BUFFER_FIXED,
+                     "socket-buffer-size", 8 * 1024 * 1024,
+                     NULL);
+
+        NSLog(@"AravisBridge: GigE stream configured (packet resend on, 8 MB socket buffer)");
     }
     
-    // Push buffers
-    NSLog(@"AravisBridge: Pushing %d buffers of size %u", 10, payload);
-    for (int i = 0; i < 10; i++) {
+    // Push buffers. A deeper pool (30 ≈ 0.5 s at 60 fps) gives the receive
+    // thread spare buffers to fill while the app still holds earlier ones in
+    // its debayer/convert/CMIO path, so a brief processing stall doesn't
+    // underrun the stream alongside the larger socket buffer above.
+    NSLog(@"AravisBridge: Pushing %d buffers of size %u", 30, payload);
+    for (int i = 0; i < 30; i++) {
         ArvBuffer *buffer = arv_buffer_new(payload, NULL);
         if (buffer) {
             // Only push buffer if stream is still valid
@@ -496,18 +529,17 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
     int timeoutCount = 0;
     NSLog(@"AravisBridge: processFrames started");
     
-    // Get stream statistics before starting
+    // Get stream statistics before starting. These counters come from the
+    // dedicated statistics API, NOT GObject properties — g_object_get with
+    // "n-completed-buffers" etc. silently returns zeros (the v1.1.21 bug that
+    // made every diagnostics stat read 0).
     if (ARV_IS_GV_STREAM(_stream)) {
         guint64 n_completed_buffers = 0;
         guint64 n_failures = 0;
         guint64 n_underruns = 0;
-        
-        g_object_get(_stream,
-                     "n-completed-buffers", &n_completed_buffers,
-                     "n-failures", &n_failures,
-                     "n-underruns", &n_underruns,
-                     NULL);
-        
+
+        arv_stream_get_statistics(_stream, &n_completed_buffers, &n_failures, &n_underruns);
+
         NSLog(@"AravisBridge: Initial stream stats - completed: %llu, failures: %llu, underruns: %llu",
               n_completed_buffers, n_failures, n_underruns);
     }
@@ -537,13 +569,8 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
                 // frame count at which `n-completed-buffers` stops advancing.
                 if (frameCount % 150 == 0 && ARV_IS_GV_STREAM(_stream)) {
                     guint64 completed = 0, failures = 0, underruns = 0, resent = 0, missing = 0;
-                    g_object_get(_stream,
-                                 "n-completed-buffers", &completed,
-                                 "n-failures", &failures,
-                                 "n-underruns", &underruns,
-                                 "n-resent-packets", &resent,
-                                 "n-missing-packets", &missing,
-                                 NULL);
+                    arv_stream_get_statistics(_stream, &completed, &failures, &underruns);
+                    arv_gv_stream_get_statistics(ARV_GV_STREAM(_stream), &resent, &missing);
                     os_log_info(AravisStreamLog(),
                                 "Stream healthy — frames=%d completed=%llu failures=%llu underruns=%llu resent=%llu missing=%llu",
                                 frameCount, completed, failures, underruns, resent, missing);
@@ -596,14 +623,9 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
                 guint64 n_underruns = 0;
                 guint64 n_resent_packets = 0;
                 guint64 n_missing_packets = 0;
-                
-                g_object_get(_stream,
-                             "n-completed-buffers", &n_completed_buffers,
-                             "n-failures", &n_failures,
-                             "n-underruns", &n_underruns,
-                             "n-resent-packets", &n_resent_packets,
-                             "n-missing-packets", &n_missing_packets,
-                             NULL);
+
+                arv_stream_get_statistics(_stream, &n_completed_buffers, &n_failures, &n_underruns);
+                arv_gv_stream_get_statistics(ARV_GV_STREAM(_stream), &n_resent_packets, &n_missing_packets);
                 
                 NSLog(@"AravisBridge: Stream stats - completed: %llu, failures: %llu, underruns: %llu, resent: %llu, missing: %llu",
                       n_completed_buffers, n_failures, n_underruns, n_resent_packets, n_missing_packets);

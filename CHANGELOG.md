@@ -1,3 +1,23 @@
+## Version 1.1.23 - 2026-06-08
+
+### Release Notes
+Adds automatic GVSP stream re-establishment to handle physical link drops
+(e.g. the fiberoptic cable being moved/unplugged). Field testing of v1.1.22
+confirmed it eliminated the packet-loss freeze (live logs: `missing=0`,
+`completed` climbing), but exposed a separate, real failure: when the camera's
+interface link dropped, the stream went silent and never recovered. The app now
+detects sustained silence (~3 s with no buffers) and rebuilds camera+stream in
+place — the same recovery a manual camera switch performs — without tearing down
+the virtual camera, so frames resume automatically when the link returns.
+
+### Changes
+- Auto re-establish the GVSP stream after ~3 s of silence (link-drop recovery), with backoff while the cable is out
+- Keep CMIO sink/preview pipeline intact across recovery (state stays Streaming; frames just pause and resume)
+- Extract shared openStreamLocked so startup and recovery use identical stream config
+- Replace the useless arv_camera_is_gv_device "health check" (a type predicate, always true) with real silence detection
+
+---
+
 ## Version 1.1.22 - 2026-06-07
 
 ### Release Notes

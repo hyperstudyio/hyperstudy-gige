@@ -48,6 +48,12 @@ static void AravisStreamThreadInit(void *user_data, ArvStreamCallbackType type, 
     }
 }
 
+// Consecutive 1 s pop-timeouts with no buffer at all before we treat the GVSP
+// stream as dead and re-establish it. ~3 s matches the camera's
+// GevHeartbeatTimeout — long enough to ride out a brief hiccup, short enough to
+// recover quickly after a physical link drop (e.g. the fiber being moved).
+static const int kStreamSilenceRecoveryTimeouts = 3;
+
 @implementation AravisCamera {
     NSString *_name;
     NSString *_modelName;
@@ -371,95 +377,71 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
 
 #pragma mark - Streaming
 
-- (BOOL)startStreaming {
-    NSLog(@"AravisBridge: startStreaming called, state=%ld", (long)_state);
-    if (!_camera || _state != AravisCameraStateConnected) {
-        NSLog(@"AravisBridge: Cannot start streaming - camera=%p, state=%ld", _camera, (long)_state);
-        return NO;
-    }
-    
-    // Reset stop flag
-    self.shouldStopStreaming = NO;
-    
+// Creates, configures, and starts the GVSP stream on the current _camera.
+// Shared by startStreaming and the in-loop recovery path so both get the
+// identical stream configuration (packet resend, timeouts, 8 MB socket buffer,
+// elevated-priority receive thread, deep buffer pool). Does NOT touch state or
+// notify the delegate — callers own lifecycle. Returns NO (and leaves _stream
+// NULL) on failure.
+- (BOOL)openStreamLocked {
+    if (!_camera) return NO;
     GError *error = NULL;
-    
+
     // Create stream with a thread-init callback so the GVSP receive thread runs
     // at elevated priority (see AravisStreamThreadInit) — keeps packet draining
     // ahead of the app's per-frame processing load.
     NSLog(@"AravisBridge: Creating stream...");
     _stream = arv_camera_create_stream(_camera, AravisStreamThreadInit, NULL, &error);
     if (!_stream) {
-        [self handleError:error message:@"Failed to create stream"];
+        NSLog(@"AravisBridge: Failed to create stream: %s", error ? error->message : "unknown");
         if (error) g_error_free(error);
         return NO;
     }
-    NSLog(@"AravisBridge: Stream created successfully");
-    
-    // Configure stream
-    NSLog(@"AravisBridge: Setting acquisition mode to continuous");
+
     arv_camera_set_acquisition_mode(_camera, ARV_ACQUISITION_MODE_CONTINUOUS, &error);
     if (error) {
         NSLog(@"AravisBridge: Error setting acquisition mode: %s", error->message);
         g_error_free(error);
         error = NULL;
     }
-    
-    // For now, we'll skip trigger mode configuration since the API might be different
-    // Most cameras default to free-running mode anyway
-    
-    // Get payload size
+
     guint payload = arv_camera_get_payload(_camera, &error);
     if (error) {
         NSLog(@"AravisBridge: Error getting payload size: %s", error->message);
         g_error_free(error);
+        g_object_unref(_stream); _stream = NULL;
         return NO;
     }
     NSLog(@"AravisBridge: Payload size = %u bytes", payload);
-    
-    // Configure stream before pushing buffers
-    // This is crucial for GigE cameras
+
     arv_stream_set_emit_signals(_stream, FALSE); // We're polling, not using signals
-    
-    // For debugging, let's check the stream type
-    NSLog(@"AravisBridge: Stream type: %s", g_type_name(G_OBJECT_TYPE(_stream)));
-    
-    // Configure GigE stream specifically
+
     if (ARV_IS_GV_STREAM(_stream)) {
-        NSLog(@"AravisBridge: Configuring GigE stream...");
-        
-        // Enable packet resend (this is critical for reliable streaming)
+        // Enable packet resend (critical for reliable GigE streaming)
         g_object_set(_stream, "packet-resend", TRUE, NULL);
-        
-        // Set initial packet timeout (in microseconds)
-        g_object_set(_stream, "packet-timeout", 40000, NULL);  // 40ms
-        
-        // Set frame retention time (in microseconds)
-        g_object_set(_stream, "frame-retention", 200000, NULL);  // 200ms
+        g_object_set(_stream, "packet-timeout", 40000, NULL);    // 40 ms
+        g_object_set(_stream, "frame-retention", 200000, NULL);  // 200 ms
 
         // Size the GVSP receive socket buffer well above a single frame.
         // macOS defaults net.inet.udp.recvspace to ~768 KB — smaller than ONE
         // 921,600-byte frame — so any receive-thread delay overflows it and
-        // drops packets, the measured cause of the stream freeze. Use a large
-        // FIXED buffer; the kernel caps it at kern.ipc.maxsockbuf (8 MB on the
-        // target host ≈ ~9 frames of headroom). In a live 90 s test this took
-        // packet loss from 575 to 0. See docs/CAMERA_MR_CAM_HR_REFERENCE.md.
+        // drops packets. A large FIXED buffer (capped by kern.ipc.maxsockbuf,
+        // 8 MB on target ≈ ~9 frames) took live packet loss from 575 to 0.
+        // See docs/CAMERA_MR_CAM_HR_REFERENCE.md.
         g_object_set(_stream,
                      "socket-buffer", ARV_GV_STREAM_SOCKET_BUFFER_FIXED,
                      "socket-buffer-size", 8 * 1024 * 1024,
                      NULL);
-
         NSLog(@"AravisBridge: GigE stream configured (packet resend on, 8 MB socket buffer)");
     }
-    
-    // Push buffers. A deeper pool (30 ≈ 0.5 s at 60 fps) gives the receive
-    // thread spare buffers to fill while the app still holds earlier ones in
-    // its debayer/convert/CMIO path, so a brief processing stall doesn't
-    // underrun the stream alongside the larger socket buffer above.
+
+    // Deep buffer pool (30 ≈ 0.5 s at 60 fps) so the receive thread has spare
+    // buffers to fill while the app still holds earlier ones in its
+    // debayer/convert/CMIO path.
     NSLog(@"AravisBridge: Pushing %d buffers of size %u", 30, payload);
     for (int i = 0; i < 30; i++) {
         ArvBuffer *buffer = arv_buffer_new(payload, NULL);
         if (buffer) {
-            // Only push buffer if stream is still valid
             if (_stream && !self.shouldStopStreaming) {
                 arv_stream_push_buffer(_stream, buffer);
             }
@@ -467,27 +449,113 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
             NSLog(@"AravisBridge: Failed to allocate buffer %d", i);
         }
     }
-    
-    // Start acquisition
+
     NSLog(@"AravisBridge: Starting acquisition");
     arv_camera_start_acquisition(_camera, &error);
     if (error) {
         NSLog(@"AravisBridge: Error starting acquisition: %s", error->message);
         g_error_free(error);
+        g_object_unref(_stream); _stream = NULL;
         return NO;
     }
-    
+
+    return YES;
+}
+
+- (BOOL)startStreaming {
+    NSLog(@"AravisBridge: startStreaming called, state=%ld", (long)_state);
+    if (!_camera || _state != AravisCameraStateConnected) {
+        NSLog(@"AravisBridge: Cannot start streaming - camera=%p, state=%ld", _camera, (long)_state);
+        return NO;
+    }
+
+    // Reset stop flag
+    self.shouldStopStreaming = NO;
+
+    if (![self openStreamLocked]) {
+        [self handleError:NULL message:@"Failed to start stream"];
+        return NO;
+    }
+
     [self setState:AravisCameraStateStreaming];
     NSLog(@"AravisBridge: State set to streaming");
-    
+
     // Start frame processing
     dispatch_async(_frameQueue, ^{
         NSLog(@"AravisBridge: Frame processing thread started");
         [self processFrames];
         NSLog(@"AravisBridge: Frame processing thread ended");
     });
-    
+
     return YES;
+}
+
+// Re-establish a dead GVSP stream in place, on the frame-processing thread.
+// Triggered when the stream goes silent for kStreamSilenceRecoveryTimeouts
+// (e.g. the fiber was moved/unplugged → camera-interface Link drop). Aravis
+// does not recover this itself, so we do exactly what a manual camera switch
+// does — fully tear down and rebuild camera + stream — except we keep
+// state == Streaming so the CMIO sink/preview pipeline stays intact and frames
+// simply resume. Retries with backoff until the camera is reachable again or
+// the user stops streaming. Returns YES if the stream was rebuilt, NO if
+// shutdown was requested mid-recovery. Must be called on _frameQueue (it never
+// blocks on the queue barrier, so it can't deadlock with disconnect).
+- (BOOL)attemptStreamRecovery {
+    NSString *ip = nil;
+    @synchronized(self) { ip = _currentCamera.ipAddress; }
+    if (ip.length == 0) {
+        os_log_error(AravisStreamLog(), "Recovery: no camera address on record, cannot re-establish");
+        return NO;
+    }
+
+    // Tear down the dead stream + camera. The link is gone, so don't try to
+    // stop acquisition on an unreachable camera — it would just block.
+    @synchronized(self) {
+        if (_stream) { g_object_unref(_stream); _stream = NULL; }
+        if (_camera) { g_object_unref(_camera); _camera = NULL; }
+    }
+
+    int attempt = 0;
+    while (!self.shouldStopStreaming) {
+        attempt++;
+        GError *error = NULL;
+        ArvCamera *cam = arv_camera_new(ip.UTF8String, &error);
+
+        if (self.shouldStopStreaming) {
+            if (cam) g_object_unref(cam);
+            if (error) g_error_free(error);
+            return NO;
+        }
+
+        if (cam) {
+            @synchronized(self) { _camera = cam; }
+            // Re-apply GVSP packet settings on the fresh camera object.
+            arv_camera_gv_set_packet_size(_camera, 1500, NULL);
+            arv_camera_gv_set_packet_delay(_camera, 750, NULL);
+
+            if ([self openStreamLocked]) {
+                os_log_error(AravisStreamLog(),
+                             "GVSP stream re-established after %d attempt(s)", attempt);
+                return YES;
+            }
+
+            // Stream open failed even though the camera answered — drop it and retry.
+            @synchronized(self) {
+                if (_stream) { g_object_unref(_stream); _stream = NULL; }
+                if (_camera) { g_object_unref(_camera); _camera = NULL; }
+            }
+        }
+        if (error) g_error_free(error);
+
+        os_log_error(AravisStreamLog(),
+                     "Recovery attempt %d failed (camera unreachable?) — retrying", attempt);
+
+        // Back off ~2 s, staying responsive to a stop request.
+        for (int i = 0; i < 20 && !self.shouldStopStreaming; i++) {
+            usleep(100000); // 100 ms × 20 = 2 s
+        }
+    }
+    return NO;
 }
 
 - (void)stopStreaming {
@@ -527,6 +595,7 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
 - (void)processFrames {
     int frameCount = 0;
     int timeoutCount = 0;
+    int consecutiveTimeouts = 0;  // reset whenever any buffer arrives; drives recovery
     NSLog(@"AravisBridge: processFrames started");
     
     // Get stream statistics before starting. These counters come from the
@@ -552,8 +621,11 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
         }
         
         ArvBuffer *buffer = arv_stream_timeout_pop_buffer(_stream, 1000000); // 1 second timeout
-        
+
         if (buffer) {
+            // Any buffer (even an incomplete/error one) means the stream is
+            // alive — clear the silence counter that drives recovery.
+            consecutiveTimeouts = 0;
             ArvBufferStatus status = arv_buffer_get_status(buffer);
             if (status == ARV_BUFFER_STATUS_SUCCESS) {
                 frameCount++;
@@ -614,6 +686,7 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
             }
         } else {
             timeoutCount++;
+            consecutiveTimeouts++;
             NSLog(@"AravisBridge: Timeout waiting for frame (timeout #%d)", timeoutCount);
             
             // Check stream statistics
@@ -642,14 +715,24 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
                              n_resent_packets, n_missing_packets);
             }
 
-            // Only check connection after first timeout
-            if (timeoutCount == 1) {
-                NSLog(@"AravisBridge: Checking camera state after first timeout");
-                gboolean is_connected = arv_camera_is_gv_device(_camera);
-                if (!is_connected) {
-                    NSLog(@"AravisBridge: Camera disconnected, stopping streaming");
-                    break;
+            // Sustained silence = the GVSP stream is dead — typically the fiber
+            // was moved/unplugged (camera-interface Link drop), which Aravis does
+            // not recover on its own. (The old `arv_camera_is_gv_device` check
+            // here was useless: it's a type predicate, always true.) Re-establish
+            // the stream ourselves — the same teardown+reconnect a manual camera
+            // switch performs, which is proven to recover — while keeping
+            // state == Streaming so the CMIO sink/preview pipeline stays intact
+            // and frames simply resume.
+            if (consecutiveTimeouts >= kStreamSilenceRecoveryTimeouts) {
+                os_log_error(AravisStreamLog(),
+                             "Stream silent for %ds — re-establishing GVSP stream (link drop?)",
+                             consecutiveTimeouts);
+                if ([self attemptStreamRecovery]) {
+                    consecutiveTimeouts = 0;
+                    continue;  // resume the loop on the freshly rebuilt stream
                 }
+                // Recovery returns NO only when shutdown was requested.
+                break;
             }
         }
     }

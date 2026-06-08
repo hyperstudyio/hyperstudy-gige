@@ -6,6 +6,9 @@ is the GigE Vision MRI-room camera the app bridges to a macOS virtual camera.
 Preserved here so the hardware's exact configuration survives across sessions
 and informs the streaming-reliability work (see the freeze investigation below).
 
+**Last updated 2026-06-08** — added the link-local reconnect behavior, the
+shipped fixes + field results (§8), and the hardware root cause (§10).
+
 ## 1. Device identity
 
 | Field | Value |
@@ -35,8 +38,17 @@ IPv4 **link-local (LLA / APIPA)** addressing.
 | Host MTU | **1500** (jumbo NOT configured on the host) |
 | Host MAC (en11) | 00:23:a4:0d:3d:2d |
 
-> The macOS interface name has varied across sessions (the v1.1.21 freeze logs
-> showed `en8`; on 2026-06-07 it enumerated as `en11`). Don't hard-code it.
+> The macOS interface name has varied across sessions (`en8`, `en11`, `en13`
+> seen on different days). Don't hard-code it.
+
+**Link-local re-negotiation (important for recovery).** Because addressing is
+APIPA, the camera re-negotiates its 169.254.x address whenever the link comes
+back up, and the host's ARP / interface bindings flush. Consequence: after a
+cable/link bounce, a **direct unicast** reconnect to the *old* IP
+(`arv_camera_new("169.254.x.x")`) keeps failing, but a **GVCP discovery
+broadcast** (`arv_update_device_list()`, i.e. the "refresh camera list" action)
+finds the camera at its current address. Recovery must therefore reconnect by
+**device ID after a discovery**, not by cached IP — see §8 (v1.1.24).
 
 ## 3. Pixel format & geometry
 
@@ -130,20 +142,44 @@ GVSP stream collapses (the freeze).
   `g_object_get(_stream,"n-completed-buffers",…)`; the correct API is
   `arv_stream_get_statistics()` / `arv_gv_stream_get_statistics()`.
 
-## 8. Validated fix direction (correctness, no watchdog)
+## 8. Resolution — shipped fixes & field results
 
-1. Set a large fixed GVSP socket buffer in `AravisBridge` stream setup:
-   `g_object_set(_stream, "socket-buffer", ARV_GV_STREAM_SOCKET_BUFFER_FIXED,
-   "socket-buffer-size", 8*1024*1024, NULL);`
-2. Elevate the receive thread: create the stream with a callback that calls
-   `arv_make_thread_high_priority()` on `ARV_STREAM_CALLBACK_TYPE_INIT`.
-3. Fix the stats instrumentation to use `arv_stream_get_statistics()` /
-   `arv_gv_stream_get_statistics()` so future captures show real numbers.
+Investigation separated **two distinct failure modes**, fixed across three
+releases (all in `AravisBridge.mm`, correctness-first, no blind watchdog):
 
-Jumbo frames are an optional further lever but require raising the host NIC MTU
-to 9000 first (camera supports up to 9152 B packets). Stream re-establishment on
-confirmed silence (hypothesis H-B / heartbeat) is held in reserve pending
-results from steps 1–3.
+**Mode 1 — packet-loss collapse** (fixed in **v1.1.22**)
+- Cause: the GVSP receive socket ran at the macOS default (~768 KB, smaller than
+  one 921,600 B frame); under the app's per-frame load the receive thread is
+  delayed, the socket overflows, packets drop, and the stream eventually wedges.
+- Fix: 8 MB fixed socket buffer (`ARV_GV_STREAM_SOCKET_BUFFER_FIXED` /
+  `socket-buffer-size`), elevated receive-thread priority (stream created with a
+  callback that calls `arv_make_thread_realtime`/`arv_make_thread_high_priority`
+  on `ARV_STREAM_CALLBACK_TYPE_INIT`), deeper buffer pool (10 → 30), and the
+  stats-API fix (`arv_stream_get_statistics` / `arv_gv_stream_get_statistics`).
+- **Field result (v1.1.23 run, 2026-06-08):** ~3 min / 11,698 frames clean,
+  `completed` tracking `frames` exactly, `missing` flat (a one-time ~632-packet
+  start-up blip, then zero growth). Confirmed fixed.
+
+**Mode 2 — physical link drop** (re-establishment added in **v1.1.23**,
+completed in **v1.1.24**)
+- Cause: a link drop (e.g. cable moved/unplugged → interface `Link` change)
+  silences the stream; Aravis never recovers on its own, and the old health
+  check `arv_camera_is_gv_device()` is a type predicate (always true), so the
+  loop spun forever.
+- v1.1.23: detect ~3 s of total silence (consecutive 1 s pop-timeouts, reset on
+  any buffer; threshold matches the 3 s `GevHeartbeatTimeout`) → tear down and
+  rebuild camera+stream while keeping `state == Streaming` so the CMIO
+  sink/preview pipeline stays intact and frames just resume. **Field-confirmed
+  detecting + retrying** on a real drop, but it retried the stale IP and so did
+  not reconnect on its own (see below).
+- v1.1.24: each recovery attempt now runs `arv_update_device_list()` (discovery)
+  and reconnects via `arv_camera_new(<deviceId>)` (current address), falling
+  back to the cached IP — mirroring the manual "refresh camera list" that was
+  proven to recover. This closes the link-local re-negotiation gap from §2.
+
+**Not pursued:** jumbo frames (would require raising host NIC MTU to 9000;
+camera supports up to 9152 B packets). Left at MTU 1500 since the socket-buffer
+fix already drove loss to 0.
 
 ## 9. How to reproduce these probes
 
@@ -157,3 +193,38 @@ arv-camera-test-0.8 -n "$CAM" -i 1500                    # baseline
 arv-camera-test-0.8 -n "$CAM" -i 1500 -a --high-priority # fix candidate
 sysctl kern.ipc.maxsockbuf net.inet.udp.recvspace        # host socket limits
 ```
+
+## 10. Hardware root cause & field troubleshooting (the converter chain)
+
+The connection path is: **camera → fiber → converter box → USB/Thunderbolt →
+Mac**. Field instability that looked like software (intermittent freezes,
+"camera not detected," users reporting **"only 3/6 lights on the USB
+converter"**) was traced to a **damaged Thunderbolt cable**. A marginal/damaged
+cable browns out or intermittently drops the link, which presents to the app as
+exactly the Mode-2 link drop in §8.
+
+Diagnostic signatures and what they mean:
+- **Only some converter LEDs lit (e.g. 3/6):** partial initialization → power /
+  cable problem, not the camera. A *fully* dead device shows no lights; a
+  good-power/no-link device shows power LEDs but dark link LEDs. Half-and-half =
+  the USB/TB host handoff isn't delivering enough (cable or port).
+- **"Camera not detected" / `arv-tool` finds nothing:** the converter's network
+  interface is absent or has no carrier. Check at the OS level:
+  ```bash
+  networksetup -listallhardwareports        # is a USB/TB Ethernet adapter present?
+  ifconfig <enX>                            # status: active? a 169.254.x inet?
+  ```
+  When working, the camera's interface shows `1000baseT`, `status: active`, and
+  a `169.254.x` link-local address; `arv-tool-0.8` lists the camera.
+- **Two different converter models failing the same way:** the converter model
+  is *not* the cause — look at the shared host side (the Mac's USB-C/TB port and
+  power, macOS version, the cable, or a shared dongle/hub).
+
+Recommendations:
+- **Replace damaged cables.** v1.1.22–v1.1.24 make the app *recover gracefully*
+  from a flaky link, but a sound cable means it rarely has to.
+- For bus-powered converters on USB-C Macs, prefer a **self-powered USB hub** —
+  rules out USB power-budget shortfalls (the "3/6 lights" class of problem).
+- The app's automatic recovery (§8) now reconnects on its own when the link
+  returns; users should no longer need to restart the app or manually refresh
+  the camera list after a transient cable/link glitch.

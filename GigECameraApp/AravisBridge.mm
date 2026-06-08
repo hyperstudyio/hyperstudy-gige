@@ -502,9 +502,13 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
 // blocks on the queue barrier, so it can't deadlock with disconnect).
 - (BOOL)attemptStreamRecovery {
     NSString *ip = nil;
-    @synchronized(self) { ip = _currentCamera.ipAddress; }
-    if (ip.length == 0) {
-        os_log_error(AravisStreamLog(), "Recovery: no camera address on record, cannot re-establish");
+    NSString *deviceId = nil;
+    @synchronized(self) {
+        ip = _currentCamera.ipAddress;
+        deviceId = _currentCamera.deviceId;
+    }
+    if (ip.length == 0 && deviceId.length == 0) {
+        os_log_error(AravisStreamLog(), "Recovery: no camera identity on record, cannot re-establish");
         return NO;
     }
 
@@ -518,8 +522,29 @@ static ArvGvFakeCamera *_fakeCameraInstance = NULL;
     int attempt = 0;
     while (!self.shouldStopStreaming) {
         attempt++;
+
+        // Re-discover before reconnecting. On a link-local (169.254.x) network
+        // the camera re-negotiates its APIPA address when the link returns, and
+        // ARP/interface bindings get flushed — so a direct unicast to the old
+        // IP keeps failing. A GVCP discovery broadcast finds the camera at its
+        // *current* address and refreshes Aravis' device list; reconnecting by
+        // device ID then resolves to that address. This mirrors the manual
+        // "refresh camera list" reconnect, which is proven to recover where a
+        // stale-IP retry does not. Safe here because the stream is already down,
+        // so the broadcast has no active stream to disturb.
+        arv_update_device_list();
+        if (self.shouldStopStreaming) return NO;
+
         GError *error = NULL;
-        ArvCamera *cam = arv_camera_new(ip.UTF8String, &error);
+        ArvCamera *cam = NULL;
+        if (deviceId.length > 0) {
+            cam = arv_camera_new(deviceId.UTF8String, &error);
+        }
+        if (!cam && ip.length > 0) {
+            // Fall back to the last-known address if discovery-by-id didn't resolve.
+            if (error) { g_error_free(error); error = NULL; }
+            cam = arv_camera_new(ip.UTF8String, &error);
+        }
 
         if (self.shouldStopStreaming) {
             if (cam) g_object_unref(cam);

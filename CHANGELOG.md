@@ -1,3 +1,21 @@
+## Version 1.1.24 - 2026-06-08
+
+### Release Notes
+Fixes automatic recovery so it actually reconnects after a link drop. Field
+testing v1.1.23 showed recovery correctly detected the drop and retried, but
+never reconnected on its own — yet a manual "refresh camera list" did. Cause:
+the camera uses link-local (169.254.x) addressing, which it re-negotiates when
+the link returns, so retrying the old IP directly kept failing. Recovery now
+runs a discovery broadcast and reconnects by device ID (its current address) on
+each attempt — exactly what the manual refresh does — so the stream re-establishes
+on its own once the cable/link comes back.
+
+### Changes
+- Recovery re-discovers (arv_update_device_list) and reconnects by device ID each attempt, instead of retrying a stale link-local IP
+- Falls back to the last-known IP if discovery-by-id doesn't resolve
+
+---
+
 ## Version 1.1.23 - 2026-06-08
 
 ### Release Notes
